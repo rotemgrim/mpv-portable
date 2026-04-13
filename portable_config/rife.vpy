@@ -50,6 +50,15 @@ if clip.fps.numerator == 0:
     clip = core.std.AssumeFPS(clip, fpsnum=24000, fpsden=1001)
 
 # RIFE needs RGB input
+orig_w = clip.width
+orig_h = clip.height
+
+# Pad to multiple of 32 (RIFE requirement)
+pad_w = (32 - orig_w % 32) % 32
+pad_h = (32 - orig_h % 32) % 32
+if pad_w or pad_h:
+    clip = core.std.AddBorders(clip, right=pad_w, bottom=pad_h)
+
 clip_rgb = core.resize.Bicubic(clip, format=vs.RGBS, matrix_in_s="709")
 
 from fractions import Fraction
@@ -70,6 +79,8 @@ clip_rgb = vsmlrt.RIFE(
     video_player=True,
 )
 
-# Convert back to original format
+# Convert back to original format and crop padding
 clip = core.resize.Bicubic(clip_rgb, format=clip.format.id if clip.format else vs.YUV420P8, matrix_s="709")
+if pad_w or pad_h:
+    clip = core.std.Crop(clip, right=pad_w, bottom=pad_h)
 clip.set_output()
