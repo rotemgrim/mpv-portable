@@ -447,7 +447,9 @@ local function spawn(time)
     end
 
     local open_filename = properties["stream-open-filename"]
-    local ytdl = open_filename and properties["demuxer-via-network"] and path ~= open_filename
+    -- Use rewritten URL whenever it differs from path (covers ytdl-hook AND
+    -- our redfish-lavf workaround). Original check required demuxer-via-network.
+    local ytdl = open_filename and path ~= open_filename
     if ytdl then
         path = open_filename
     end
