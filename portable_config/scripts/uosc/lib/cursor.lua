@@ -373,8 +373,12 @@ end
 function cursor:leave() self:move(math.huge, math.huge) end
 
 function cursor:is_autohide_allowed()
+	-- Patched: allow autohide even when cursor is over interactive uosc elements
+	-- (seekbar, volume, controls). Upstream prevents autohide in that case via
+	-- `is_dragging_prevented`, which makes the UI stay visible as long as the
+	-- cursor rests on it. We want the entire UI to disappear after the mpv
+	-- `cursor-autohide` timeout regardless of cursor position.
 	return options.autohide and (not self.autohide_fs_only or state.fullscreen)
-		and not self.is_dragging_prevented
 		and not Menu:is_open()
 end
 mp.observe_property('cursor-autohide-fs-only', 'bool', function(_, val) cursor.autohide_fs_only = val end)
