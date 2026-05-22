@@ -66,15 +66,51 @@ from fractions import Fraction
 # Convert multi to Fraction for RIFE (supports 2.5 etc)
 rife_multi_frac = Fraction(rife_multi).limit_denominator(10)
 
-# Run RIFE via ORT DirectML (GPU)
+# Backend preference: TRT_RTX (fastest on RTX, native Blackwell support)
+# > ORT_CUDA > ORT_DML (any GPU vendor).
+plugins_dir = os.path.join(site_packages, "vapoursynth", "plugins")
+vsort_dir   = os.path.join(plugins_dir, "vsort")
+trt_rtx_exe = os.path.join(plugins_dir, "vsmlrt-cuda", "tensorrt_rtx.exe")
+# The bundled vsort plugin is built against CUDA 13: requires cublas64_13.dll
+# (CUDA 12's cublas64_12.dll is the wrong major version).
+has_trt_rtx  = os.path.exists(trt_rtx_exe) and os.path.exists(os.path.join(plugins_dir, "vstrt_rtx.dll"))
+has_cuda_dlls = os.path.exists(os.path.join(vsort_dir, "cublas64_13.dll"))
+
+if has_trt_rtx:
+    try:
+        os.add_dll_directory(os.path.join(plugins_dir, "vsmlrt-cuda"))
+    except (AttributeError, OSError):
+        pass
+    # fp16=False here: vsmlrt's fp16 path imports the `onnx` PyPI package to
+    # rewrite the ONNX file in Python, which isn't installed in the embeddable
+    # Python. TensorRT-RTX still runs on Tensor cores with fp32 I/O.
+    backend = vsmlrt.Backend.TRT_RTX(
+        num_streams=rife_streams,
+        fp16=False,
+        use_cuda_graph=True,
+    )
+elif has_cuda_dlls:
+    # Ensure the loader finds CUDA/cuDNN DLLs we dropped next to onnxruntime.dll
+    try:
+        os.add_dll_directory(vsort_dir)
+    except (AttributeError, OSError):
+        pass
+    backend = vsmlrt.Backend.ORT_CUDA(
+        num_streams=rife_streams,
+        fp16=bool(rife_fp16),
+        cudnn_benchmark=True,
+    )
+else:
+    backend = vsmlrt.Backend.ORT_DML(
+        num_streams=rife_streams,
+        fp16=bool(rife_fp16),
+    )
+
 clip_rgb = vsmlrt.RIFE(
     clip_rgb,
     multi=rife_multi_frac,
     model=rife_model,
-    backend=vsmlrt.Backend.ORT_DML(
-        num_streams=rife_streams,
-        fp16=bool(rife_fp16),
-    ),
+    backend=backend,
     ensemble=bool(rife_ensemble),
     video_player=True,
 )
