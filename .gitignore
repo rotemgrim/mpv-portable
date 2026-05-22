@@ -15,3 +15,17 @@ desktop.ini
 # Logs
 *.log
 /.idea/
+
+# CUDA / cuDNN DLLs (downloaded by setup-cuda.bat — too large for git)
+/.cuda-dl-tmp/
+Lib/site-packages/vapoursynth/plugins/vsort/cudart64_*.dll
+Lib/site-packages/vapoursynth/plugins/vsort/cublas*64_*.dll
+Lib/site-packages/vapoursynth/plugins/vsort/cufft*64_*.dll
+Lib/site-packages/vapoursynth/plugins/vsort/cudnn*.dll
+Lib/site-packages/vapoursynth/plugins/vsort/nvblas*.dll
+Lib/site-packages/vapoursynth/plugins/vsort/nvrtc*.dll
+Lib/site-packages/vapoursynth/plugins/vsort/nvcudart_*.dll
+Lib/site-packages/vapoursynth/plugins/vsort/cupti*.dll
+Lib/site-packages/vapoursynth/plugins/vsort/nvperf_*.dll
+Lib/site-packages/vapoursynth/plugins/vsort/checkpoint.dll
+Lib/site-packages/vapoursynth/plugins/vsort/pcsamplingutil.dll
