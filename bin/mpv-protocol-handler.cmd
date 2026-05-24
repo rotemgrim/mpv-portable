@@ -16,11 +16,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$u = [uri]::UnescapeDataString($u);" ^
   "$u = $u -replace '^(https?|ftps?|rtmps?|rtsp|mms|file|srt)//','$1://';" ^
   "if ($u -notmatch '^[a-zA-Z][a-zA-Z0-9+.-]*:') { $u = $u -replace '^([A-Za-z])([\\/])','$1:$2' };" ^
-  "if ($u -match '^[A-Za-z]:[\\/]') { $u = 'lavf://' + $u };" ^
+  "if ($u -match '^[A-Za-z]:[\\/]') { $u = 'lavf://file:' + $u };" ^
   "$d = $env:MPV_DIR;" ^
   "((Get-Date -Format o) + '  ' + $u) | Add-Content -LiteralPath (Join-Path $d 'mpv-protocol-handler.log');" ^
   "$q = [char]34;" ^
   "$arg = '-- ' + $q + ($u -replace $q, ($q+$q)) + $q;" ^
-  "Start-Process -FilePath (Join-Path $d 'mpv.exe') -ArgumentList $arg -WorkingDirectory $d"
+  "$psi = New-Object System.Diagnostics.ProcessStartInfo -Property @{FileName=(Join-Path $d 'mpv.exe'); Arguments=$arg; UseShellExecute=$false; WorkingDirectory=$d; RedirectStandardInput=$true; RedirectStandardOutput=$true; RedirectStandardError=$true};" ^
+  "try { $p = [System.Diagnostics.Process]::Start($psi); $p.StandardInput.Close(); $p.StandardOutput.Close(); $p.StandardError.Close() } catch { ((Get-Date -Format o) + '  ERROR ' + $_.Exception.Message) | Add-Content -LiteralPath (Join-Path $d 'mpv-protocol-handler.log') }"
 
 endlocal
