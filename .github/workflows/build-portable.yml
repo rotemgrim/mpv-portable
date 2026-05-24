@@ -112,22 +112,25 @@ jobs:
       - name: Write SFX config
         shell: pwsh
         run: |
-          $cfg = @'
-;!@Install@!UTF-8!
-Title="mpv-portable"
-BeginPrompt="Extract mpv-portable to a folder of your choice?"
-ExtractTitle="Extracting mpv-portable"
-ExtractDialogText="Please wait while mpv-portable is extracted..."
-ExtractPathTitle="Choose destination folder"
-ExtractPathText="Files will be extracted to:"
-InstallPath="%%S\\mpv-portable"
-GUIMode="1"
-GUIFlags="8+32+64+256"
-FinishMessage="mpv-portable extracted. Double-click bin\\mpv.exe to launch."
-;!@InstallEnd@!
-'@
-          # Config must be UTF-8 with no BOM and CRLF line endings.
-          $cfg = $cfg -replace "`r?`n", "`r`n"
+          # Build the 7-Zip SFX config as a CRLF-joined string. Avoids a
+          # PowerShell here-string, whose content must start at column 0
+          # and would terminate the surrounding YAML literal block early.
+          $lines = @(
+            ';!@Install@!UTF-8!',
+            'Title="mpv-portable"',
+            'BeginPrompt="Extract mpv-portable to a folder of your choice?"',
+            'ExtractTitle="Extracting mpv-portable"',
+            'ExtractDialogText="Please wait while mpv-portable is extracted..."',
+            'ExtractPathTitle="Choose destination folder"',
+            'ExtractPathText="Files will be extracted to:"',
+            'InstallPath="%%S\\mpv-portable"',
+            'GUIMode="1"',
+            'GUIFlags="8+32+64+256"',
+            'FinishMessage="mpv-portable extracted. Double-click bin\\mpv.exe to launch."',
+            ';!@InstallEnd@!'
+          )
+          $cfg = ($lines -join "`r`n") + "`r`n"
+          # 7-Zip SFX config must be UTF-8 with no BOM, CRLF line endings.
           [System.IO.File]::WriteAllText("$env:RUNNER_TEMP\config.txt", $cfg, (New-Object System.Text.UTF8Encoding $false))
 
       - name: Build self-extracting exe
