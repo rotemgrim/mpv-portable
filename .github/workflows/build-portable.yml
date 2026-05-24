@@ -1,0 +1,180 @@
+name: Build portable SFX
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download binary payload from release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $staging = "$env:RUNNER_TEMP\stage"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          # Pull the heavy binaries (mpv.exe, VS plugins, ONNX models, ...) from the
+          # rolling "payload" release. They are NOT in git -- see tools/build-payload.ps1.
+          $payload = "$env:RUNNER_TEMP\payload.7z"
+          $shaFile = "$payload.sha256"
+          gh release download payload --repo "$env:GITHUB_REPOSITORY" --pattern 'payload.7z' --pattern 'payload.7z.sha256' --dir "$env:RUNNER_TEMP" --clobber
+          if ($LASTEXITCODE -ne 0) { throw "gh release download failed (does the 'payload' release exist? run tools/build-payload.ps1 locally first)" }
+          # Verify checksum.
+          if (Test-Path $shaFile) {
+            $expected = (Get-Content $shaFile -Raw).Trim().Split(' ')[0].ToLower()
+            $actual   = (Get-FileHash -Algorithm SHA256 $payload).Hash.ToLower()
+            if ($expected -ne $actual) { throw "payload SHA256 mismatch: expected $expected, got $actual" }
+            Write-Host "payload.7z SHA256 OK: $actual"
+          } else {
+            Write-Warning "No payload.7z.sha256 alongside payload; skipping integrity check."
+          }
+          Write-Host "Extracting payload to $staging ..."
+          & 7z x -y -o"$staging" $payload | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "7z extract of payload failed" }
+
+      - name: Overlay repo source files onto staging
+        shell: pwsh
+        run: |
+          $staging = "$env:RUNNER_TEMP\stage"
+          # Layer the small text/config/script files from the repo on top of the
+          # extracted binary payload. Repo files take precedence (configs may have
+          # been edited since the payload was built).
+          robocopy . $staging /E `
+            /XD .git .github .idea .claude tools `
+            /XF .gitattributes .gitignore bootstrap.ps1 *.log payload.7z payload.7z.sha256
+          if ($LASTEXITCODE -ge 8) { exit $LASTEXITCODE } else { $global:LASTEXITCODE = 0 }
+          # Sanity check: critical binaries must be present after the merge.
+          foreach ($f in @('bin\mpv.exe', 'bin\python314.dll', 'bin\Lib\site-packages\vapoursynth\vapoursynth.pyd')) {
+            if (-not (Test-Path (Join-Path $staging $f))) { throw "missing in staged tree: $f" }
+          }
+          Write-Host "Staged tree top level:"
+          Get-ChildItem $staging | Format-Table -AutoSize
+
+      - name: Generate relative mpv.lnk
+        shell: pwsh
+        run: |
+          # Create the shortcut with absolute paths *inside the staging dir*. Because the
+          # target sits in a child folder of the .lnk, IShellLink also stores a RelativePath
+          # ("bin\mpv.exe"). When the absolute path doesn't exist on the user's machine
+          # after extraction, Windows falls back to RelativePath relative to the .lnk's
+          # own location -- so this works wherever they extract.
+          $staging = "$env:RUNNER_TEMP\stage"
+          $lnkPath = Join-Path $staging 'mpv.lnk'
+          $target  = Join-Path $staging 'bin\mpv.exe'
+          $workdir = Join-Path $staging 'bin'
+          if (-not (Test-Path $target)) { throw "target missing: $target" }
+          $sh  = New-Object -ComObject WScript.Shell
+          $lnk = $sh.CreateShortcut($lnkPath)
+          $lnk.TargetPath       = $target
+          $lnk.WorkingDirectory = $workdir
+          $lnk.IconLocation     = "$target,0"
+          $lnk.Description      = 'mpv (portable)'
+          $lnk.Save()
+          $bytes = [System.IO.File]::ReadAllBytes($lnkPath)
+          $utf16 = [System.Text.Encoding]::Unicode.GetString($bytes)
+          $ascii = -join ($bytes | ForEach-Object { if ($_ -ge 32 -and $_ -lt 127) { [char]$_ } else { '.' } })
+          if ($ascii -notmatch 'bin\\mpv\.exe' -and $utf16 -notmatch 'bin\\mpv\.exe') {
+            throw "RelativePath 'bin\mpv.exe' was not embedded in $lnkPath"
+          }
+          Write-Host "OK: $lnkPath ($((Get-Item $lnkPath).Length) bytes) embeds RelativePath."
+
+      - name: Create 7z archive
+        shell: pwsh
+        run: |
+          $staging = "$env:RUNNER_TEMP\stage"
+          $archive = "$env:RUNNER_TEMP\sfx-payload.7z"
+          # The bulk of the payload (DLLs, ONNX, etc.) is mostly-incompressible. Use
+          # mx=1 for a fast, lightly-compressed repack -- the original payload.7z
+          # already did the real compression work.
+          & 7z a -t7z -mx=1 -mmt=on $archive "$staging\*"
+          if ($LASTEXITCODE -ne 0) { throw "7z failed" }
+          "{0:N1} MB" -f ((Get-Item $archive).Length / 1MB) | Write-Host
+
+      - name: Download 7-Zip SFX module (7zsfxmm)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/chrislake/7zsfxmm/releases/download/1.7.1.3901/7zsd_extra_171_3901.7z"
+          $out = "$env:RUNNER_TEMP\sfx.7z"
+          Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
+          & 7z x -y -o"$env:RUNNER_TEMP\sfx" $out | Out-Null
+          Get-ChildItem -Recurse "$env:RUNNER_TEMP\sfx" -Filter *.sfx | Select-Object FullName, Length
+
+      - name: Write SFX config
+        shell: pwsh
+        run: |
+          $cfg = @'
+;!@Install@!UTF-8!
+Title="mpv-portable"
+BeginPrompt="Extract mpv-portable to a folder of your choice?"
+ExtractTitle="Extracting mpv-portable"
+ExtractDialogText="Please wait while mpv-portable is extracted..."
+ExtractPathTitle="Choose destination folder"
+ExtractPathText="Files will be extracted to:"
+InstallPath="%%S\\mpv-portable"
+GUIMode="1"
+GUIFlags="8+32+64+256"
+FinishMessage="mpv-portable extracted. Double-click bin\\mpv.exe to launch."
+;!@InstallEnd@!
+'@
+          # Config must be UTF-8 with no BOM and CRLF line endings.
+          $cfg = $cfg -replace "`r?`n", "`r`n"
+          [System.IO.File]::WriteAllText("$env:RUNNER_TEMP\config.txt", $cfg, (New-Object System.Text.UTF8Encoding $false))
+
+      - name: Build self-extracting exe
+        shell: pwsh
+        run: |
+          $sfx = Get-ChildItem -Recurse "$env:RUNNER_TEMP\sfx" -Filter "7zsd_All_x64.sfx" | Select-Object -First 1
+          if (-not $sfx) {
+            $sfx = Get-ChildItem -Recurse "$env:RUNNER_TEMP\sfx" -Filter "7zsd_LZMA2_x64.sfx" | Select-Object -First 1
+          }
+          if (-not $sfx) { throw "No SFX module found" }
+          Write-Host "Using SFX module: $($sfx.FullName)"
+          $out = "$env:RUNNER_TEMP\mpv-portable.exe"
+          $parts = @($sfx.FullName, "$env:RUNNER_TEMP\config.txt", "$env:RUNNER_TEMP\sfx-payload.7z")
+          $fsOut = [System.IO.File]::Create($out)
+          try {
+            foreach ($p in $parts) {
+              $bytes = [System.IO.File]::ReadAllBytes($p)
+              $fsOut.Write($bytes, 0, $bytes.Length)
+            }
+          } finally { $fsOut.Dispose() }
+          if (-not (Test-Path $out)) { throw "SFX build failed" }
+          "{0:N1} MB" -f ((Get-Item $out).Length / 1MB) | Write-Host
+
+      - name: Smoke-test (header check)
+        shell: pwsh
+        run: |
+          # The resulting file should be a valid PE; verify it starts with "MZ".
+          $b = [byte[]](Get-Content -AsByteStream -TotalCount 2 "$env:RUNNER_TEMP\mpv-portable.exe")
+          if ($b[0] -ne 0x4D -or $b[1] -ne 0x5A) { throw "Output is not a PE executable" }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mpv-portable
+          path: ${{ runner.temp }}/mpv-portable.exe
+          if-no-files-found: error
+
+      - name: Publish rolling "latest" release
+        if: github.ref == 'refs/heads/master'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest portable build
+          body: |
+            Automated portable build of commit ${{ github.sha }}.
+
+            Download `mpv-portable.exe`, double-click it, choose a folder, and the portable mpv install is extracted there. Run `bin\mpv.exe` to launch.
+          files: ${{ runner.temp }}/mpv-portable.exe
+          prerelease: false
+          make_latest: true
