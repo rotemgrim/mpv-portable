@@ -15,8 +15,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$u = $u.TrimEnd('/');" ^
   "$u = [uri]::UnescapeDataString($u);" ^
   "$u = $u -replace '^(https?|ftps?|rtmps?|rtsp|mms|file|srt)//','$1://';" ^
+  "if ($u -notmatch '^[a-zA-Z][a-zA-Z0-9+.-]*:') { $u = $u -replace '^([A-Za-z])([\\/])','$1:$2' };" ^
+  "if ($u -match '^[A-Za-z]:[\\/]') { $u = 'lavf://' + $u };" ^
   "$d = $env:MPV_DIR;" ^
   "((Get-Date -Format o) + '  ' + $u) | Add-Content -LiteralPath (Join-Path $d 'mpv-protocol-handler.log');" ^
-  "Start-Process -FilePath (Join-Path $d 'mpv.exe') -ArgumentList @('--', $u) -WorkingDirectory $d"
+  "$q = [char]34;" ^
+  "$arg = '-- ' + $q + ($u -replace $q, ($q+$q)) + $q;" ^
+  "Start-Process -FilePath (Join-Path $d 'mpv.exe') -ArgumentList $arg -WorkingDirectory $d"
 
 endlocal
