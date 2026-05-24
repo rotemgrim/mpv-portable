@@ -15,6 +15,30 @@ desktop.ini
 # Logs
 *.log
 /.idea/
+/.claude/
+
+# Generated at build time by .github/workflows/build-portable.yml
+/mpv.lnk
+
+# Build artifacts from tools/build-payload.ps1
+/payload.7z
+/payload.7z.sha256
+
+# ---------------------------------------------------------------------------
+# Heavy binary payload. NOT tracked in git -- shipped as a single .7z asset
+# on the GitHub release tag "payload". Run ./bootstrap.ps1 to populate, or
+# tools/build-payload.ps1 to refresh the release. Keep this list in sync
+# with the $includes array in tools/build-payload.ps1.
+# ---------------------------------------------------------------------------
+bin/*.exe
+bin/*.dll
+bin/*.pyd
+bin/*.zip
+bin/Lib/site-packages/onnx/
+bin/Lib/site-packages/onnx-*.dist-info/
+bin/Lib/site-packages/vapoursynth/
+bin/portable_config/fonts/
+bin/portable_config/scripts/uosc/bin/
 
 # CUDA / cuDNN DLLs (downloaded by setup-cuda.bat — too large for git)
 bin/.cuda-dl-tmp/
@@ -29,3 +53,10 @@ bin/Lib/site-packages/vapoursynth/plugins/vsort/cupti*.dll
 bin/Lib/site-packages/vapoursynth/plugins/vsort/nvperf_*.dll
 bin/Lib/site-packages/vapoursynth/plugins/vsort/checkpoint.dll
 bin/Lib/site-packages/vapoursynth/plugins/vsort/pcsamplingutil.dll
+
+# TensorRT-RTX runtime (~3 GB, downloaded by bin/setup-trt.ps1)
+bin/Lib/site-packages/vapoursynth/plugins/vsmlrt-cuda/
+
+# Per-GPU TensorRT engine caches (built JIT on first RIFE run)
+*.engine
+*.engine.cache
