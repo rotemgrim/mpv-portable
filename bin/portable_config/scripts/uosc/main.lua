@@ -101,6 +101,7 @@ defaults = {
 	chapter_range_patterns = 'openings:オープニング;endings:エンディング',
 	languages = 'slang,en',
 	subtitles_directory = '~~/subtitles',
+	subdl_api_key = '',
 	disable_elements = '',
 }
 options = table_copy(defaults)
@@ -174,6 +175,7 @@ config = {
 	version = uosc_version,
 	open_subtitles_api_key = 'b0rd16N0bp7DETMpO4pYZwIqmQkZbYQr',
 	open_subtitles_agent = 'uosc v' .. uosc_version,
+	subdl_api_key = options.subdl_api_key,
 	-- sets max rendering frequency in case the
 	-- native rendering frequency could not be detected
 	render_delay = 1 / 60,
@@ -231,6 +233,18 @@ config = {
 	timeline_step = 5,
 	timeline_step_flag = '',
 }
+
+-- Path used to persist a SubDL API key entered through the downloader menu.
+config.subdl_api_key_path = mp.command_native({'expand-path', '~~/subdl_api_key.txt'})
+-- If the key isn't set in uosc.conf, fall back to a previously saved one.
+if config.subdl_api_key == '' then
+	local file = io.open(config.subdl_api_key_path, 'r')
+	if file then
+		local saved = file:read('*a')
+		file:close()
+		if saved then config.subdl_api_key = saved:match('^%s*(.-)%s*$') end
+	end
+end
 
 function update_load_types()
 	local extensions = {}
@@ -828,6 +842,15 @@ bind_command('keybinds', function()
 	end
 end)
 bind_command('download-subtitles', open_subtitle_downloader)
+-- Real moviehash OpenSubtitles search, restricted to Hebrew + English.
+bind_command('download-subtitles-heb-eng', function()
+	open_subtitle_downloader({
+		menu_type = 'download-subtitles-heb-eng',
+		title = t('Search by hash (HE/EN)'),
+		languages = {'he', 'en'},
+	})
+end)
+bind_command('download-subtitles-subdl', open_subdl_downloader)
 bind_command('load-subtitles', create_track_loader_menu_opener({
 	prop = 'sub',
 	title = t('Load subtitles'),
@@ -853,7 +876,8 @@ bind_command('subtitles', create_select_tracklist_type_menu_opener({
 	enable_prop = 'sub-visibility',
 	secondary = {prop = 'secondary-sid', icon = 'vertical_align_top', enable_prop = 'secondary-sub-visibility'},
 	load_command = 'script-binding uosc/load-subtitles',
-	download_command = 'script-binding uosc/download-subtitles',
+	download_command = 'script-binding uosc/download-subtitles-heb-eng',
+	subdl_command = 'script-binding uosc/download-subtitles-subdl',
 }))
 bind_command('audio', create_select_tracklist_type_menu_opener({
 	title = t('Audio'), type = 'audio', prop = 'aid', load_command = 'script-binding uosc/load-audio',

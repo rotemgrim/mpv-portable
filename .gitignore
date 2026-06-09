@@ -2,6 +2,9 @@
 bin/portable_config/cache/
 bin/portable_config/watch_later/
 
+# SubDL API key saved via the subtitle downloader menu (secret)
+bin/portable_config/subdl_api_key.txt
+
 # Python bytecode
 __pycache__/
 *.pyc

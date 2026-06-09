@@ -201,7 +201,7 @@ function create_self_updating_menu_opener(opts)
 	end
 end
 
----@param opts {title: string; type: string; prop: string; enable_prop?: string; secondary?: {prop: string; icon: string; enable_prop?: string}; load_command: string; download_command?: string}
+---@param opts {title: string; type: string; prop: string; enable_prop?: string; secondary?: {prop: string; icon: string; enable_prop?: string}; load_command: string; download_command?: string; subdl_command?: string}
 function create_select_tracklist_type_menu_opener(opts)
 	local snd = opts.secondary
 	local function get_props()
@@ -218,9 +218,25 @@ function create_select_tracklist_type_menu_opener(opts)
 				italic = true,
 				hint = t('open file'),
 				value = '{load}',
-				actions = opts.download_command
-					and {{name = 'download', icon = 'language', label = t('Search online')}}
-					or nil,
+			}
+		end
+		-- Explicit, always-visible "download subtitles" rows (rather than hover-only actions).
+		if opts.download_command then
+			items[#items + 1] = {
+				title = t('Search by hash (HE/EN)'),
+				italic = true,
+				hint = t('online'),
+				icon = 'tag',
+				value = '{download}',
+			}
+		end
+		if opts.subdl_command then
+			items[#items + 1] = {
+				title = t('Search SubDL'),
+				italic = true,
+				hint = t('online'),
+				icon = 'subtitles',
+				value = '{subdl}',
 			}
 		end
 		if #items > 0 then
@@ -311,7 +327,11 @@ function create_select_tracklist_type_menu_opener(opts)
 	---@param event MenuEventActivate
 	local function handle_activate(event)
 		if event.value == '{load}' then
-			mp.command(event.action == 'download' and opts.download_command or opts.load_command)
+			mp.command(opts.load_command)
+		elseif event.value == '{download}' then
+			mp.command(opts.download_command)
+		elseif event.value == '{subdl}' then
+			mp.command(opts.subdl_command)
 		else
 			if snd and (event.action == 'as_secondary' or event.modifiers == 'shift') then
 				local _, snd_track_index = get_props()
@@ -884,8 +904,10 @@ function create_track_loader_menu_opener(opts)
 	end
 end
 
-function open_subtitle_downloader()
-	local menu_type = 'download-subtitles'
+---@param opts? {menu_type?: string, title?: string, languages?: string[]}
+function open_subtitle_downloader(opts)
+	opts = opts or {}
+	local menu_type = opts.menu_type or 'download-subtitles'
 	---@type Menu
 	local menu
 
@@ -1012,7 +1034,8 @@ function open_subtitle_downloader()
 
 		local args = itable_join({'search-subtitles'}, credentials)
 
-		local languages = itable_filter(get_languages(), function(lang) return lang:match('.json$') == nil end)
+		local languages = opts.languages
+			or itable_filter(get_languages(), function(lang) return lang:match('.json$') == nil end)
 		args[#args + 1] = '--languages'
 		args[#args + 1] = table.concat(table_keys(create_set(languages)), ',') -- deduplicates stuff like `en,eng,en`
 
@@ -1098,7 +1121,7 @@ function open_subtitle_downloader()
 	menu = Menu:open(
 		{
 			type = menu_type,
-			title = t('enter query'),
+			title = opts.title or t('enter query'),
 			items = initial_items,
 			search_style = 'palette',
 			on_search = 'callback',
@@ -1129,6 +1152,374 @@ function open_subtitle_downloader()
 					end)
 				elseif not event.action then
 					handle_download(event.value)
+				end
+			elseif event.type == 'search' then
+				handle_search(event.query)
+			end
+		end
+	)
+end
+
+-- Subtitle downloader backed by the SubDL API (https://subdl.com/api-doc).
+-- Note: SubDL's API has no moviehash search, so we match by the release filename
+-- (and auto-detected season/episode for TV), which is its recommended precise method.
+-- Only Hebrew (HE) and English (EN) results are requested.
+function open_subdl_downloader()
+	local menu_type = 'download-subtitles-subdl'
+	---@type Menu
+	local menu
+
+	if Menu:is_open(menu_type) then
+		Menu:close()
+		return
+	end
+
+	local search_suggestion, destination_directory = '', nil
+
+	if state.path then
+		if is_protocol(state.path) then
+			local title = mp.get_property_native('media-title')
+			if title and not is_protocol(title) then search_suggestion = title end
+		else
+			local serialized_path = serialize_path(state.path)
+			if serialized_path then
+				search_suggestion = serialized_path.basename
+				destination_directory = serialized_path.dirname
+			end
+		end
+	end
+
+	local force_destination = options.subtitles_directory:sub(1, 1) == '!'
+	if force_destination or not destination_directory then
+		local subtitles_directory = options.subtitles_directory:sub(force_destination and 2 or 1)
+		destination_directory = mp.command_native({'expand-path', subtitles_directory})
+	end
+
+	local handle_search, handle_download
+	-- When the API key isn't set, we reuse this menu's search field to enter it.
+	local awaiting_api_key = false
+	local pending_query = nil
+	local search_title = t('SubDL search')
+	local register_url = 'https://subdl.com/panel/api'
+
+	-- Opens a url in the system browser/file explorer.
+	---@param url string
+	local function open_url(url)
+		local command = ({windows = 'explorer', linux = 'xdg-open', darwin = 'open'})[state.platform]
+		mp.command_native_async({
+			name = 'subprocess',
+			capture_stderr = true,
+			capture_stdout = true,
+			playback_only = false,
+			args = {command, url},
+		}, function() end)
+	end
+
+	-- Changes the menu title (also used as the search-field placeholder in palette menus).
+	---@param title string
+	local function set_title(title)
+		if menu and menu.current then
+			menu.current.title = title
+			menu.current.ass_safe_title = nil
+			request_render()
+		end
+	end
+
+	---@param title string
+	---@param detail? string
+	local function report_error(title, detail)
+		if detail and detail ~= '' then msg.error(title .. ': ' .. tostring(detail)) else msg.error(title) end
+		if menu and menu:is_alive() then
+			menu:update_items({
+				{title = t(title), align = 'center', muted = true, italic = true, selectable = false},
+				{title = t('See console for details.'), align = 'center', muted = true, italic = true, selectable = false},
+			})
+		end
+	end
+
+	---@param args string[]
+	---@param callback fun(success: boolean, result: table|nil, error: string|nil)
+	local function run_async(args, callback)
+		return mp.command_native_async({
+			name = 'subprocess',
+			capture_stdout = true,
+			capture_stderr = true,
+			playback_only = false,
+			args = args,
+		}, function(success, result, error) callback(success, result, error) end)
+	end
+
+	-- Switches the menu into "enter API key" mode, reusing the search field for input.
+	local function prompt_for_api_key()
+		awaiting_api_key = true
+		if menu and menu:is_alive() then
+			menu:search_query_replace('') -- clear the pre-filled filename so the key can be pasted
+			-- The title doubles as the search-field placeholder, making it clear this isn't a search.
+			set_title(t('Paste your SubDL API key'))
+			menu:update_items({
+				{
+					title = t('Get a free API key'),
+					hint = 'subdl.com',
+					icon = 'open_in_new',
+					bold = true,
+					value = {open_url = register_url},
+					keep_open = true,
+				},
+				{
+					title = t('Register, copy your API key, then paste it above and press enter'),
+					align = 'center', muted = true, italic = true, selectable = false,
+				},
+			})
+		end
+	end
+
+	---@param key string
+	local function save_api_key(key)
+		config.subdl_api_key = key
+		local path = config.subdl_api_key_path or mp.command_native({'expand-path', '~~/subdl_api_key.txt'})
+		local file = io.open(path, 'w')
+		if file then
+			file:write(key)
+			file:close()
+		else
+			msg.warn('Could not persist SubDL API key to ' .. tostring(path))
+		end
+	end
+
+	---@param query string
+	handle_search = function(query)
+		if not menu or not menu:is_alive() then return end
+
+		-- We're waiting for the user to type/paste their API key into the search field.
+		if awaiting_api_key then
+			local key = trim(query)
+			if key == '' then
+				prompt_for_api_key()
+				return
+			end
+			save_api_key(key)
+			awaiting_api_key = false
+			set_title(search_title)
+			handle_search(pending_query or '')
+			return
+		end
+
+		menu:update_items({{icon = 'spinner', align = 'center', selectable = false, muted = true}})
+
+		if not config.subdl_api_key or config.subdl_api_key == '' then
+			pending_query = query
+			prompt_for_api_key()
+			return
+		end
+
+		-- `curl -G` with `--data-urlencode` lets curl handle URL encoding for us.
+		local args = {
+			'curl', '-s', '-L', '-G', 'https://api.subdl.com/api/v1/subtitles',
+			'--data-urlencode', 'api_key=' .. config.subdl_api_key,
+			'--data-urlencode', 'languages=HE,EN',
+			'--data-urlencode', 'subs_per_page=30',
+		}
+
+		local function add_param(key, value) args[#args + 1] = '--data-urlencode'; args[#args + 1] = key .. '=' .. value end
+
+		local season, episode = query:match('[Ss](%d%d?)[Ee](%d%d?)')
+		if season and episode then
+			local cut = query:find('[Ss]%d%d?[Ee]%d%d?')
+			local title = trim((query:sub(1, cut - 1):gsub('[%._]', ' ')))
+			add_param('type', 'tv')
+			if #title > 0 then add_param('film_name', title) end
+			add_param('season_number', tostring(tonumber(season)))
+			add_param('episode_number', tostring(tonumber(episode)))
+		else
+			-- Looks like a release filename? match precisely via file_name, else treat it as a title.
+			local lower = query:lower()
+			local is_filename = query:match('%.') or lower:match('%d%d%d%dp') or lower:match('x26[45]') or
+				lower:match('blu%-?ray') or lower:match('web')
+			if is_filename then
+				add_param('file_name', query)
+			else
+				add_param('film_name', (query:gsub('%.%w+$', '')))
+			end
+		end
+
+		run_async(args, function(success, result, error)
+			if not menu or not menu:is_alive() then return end
+			if not success or not result or result.status ~= 0 then
+				report_error('SubDL search request failed', error or (result and result.stderr))
+				return
+			end
+
+			local data = utils.parse_json(result.stdout or '')
+			if not data then
+				report_error('Could not parse SubDL response', result.stdout)
+				return
+			end
+			if data.status == false then
+				-- A bad/expired key is the most likely setup failure: let the user re-enter it.
+				if tostring(data.error or ''):lower():match('key') or tostring(data.error or ''):lower():match('auth') then
+					msg.error('SubDL error: ' .. tostring(data.error))
+					pending_query = query
+					prompt_for_api_key()
+				else
+					report_error('SubDL error', data.error)
+				end
+				return
+			end
+
+			local subs = type(data.subtitles) == 'table' and data.subtitles or {}
+			local he, en = {}, {}
+			for _, sub in ipairs(subs) do
+				if sub and sub.url then
+					local code = tostring(sub.language or sub.lang or ''):upper()
+					local name = tostring(sub.lang or ''):lower()
+					if code:match('^HE') or name:match('hebrew') then
+						he[#he + 1] = sub
+					elseif code:match('^EN') or name:match('english') then
+						en[#en + 1] = sub
+					end
+				end
+			end
+
+			local function release_item(sub)
+				local hints = {}
+				if sub.hi then hints[#hints + 1] = t('hearing impaired') end
+				if sub.season and sub.episode then
+					hints[#hints + 1] = string.format('S%02dE%02d', sub.season, sub.episode)
+				elseif sub.full_season then
+					hints[#hints + 1] = t('full season')
+				end
+				if sub.author and sub.author ~= '' then hints[#hints + 1] = sub.author end
+				local url = sub.url:sub(1, 4) == 'http' and sub.url or ('https://dl.subdl.com' .. sub.url)
+				local page = sub.subtitlePage and ('https://subdl.com' .. sub.subtitlePage) or nil
+				return {
+					title = sub.release_name or sub.name or t('subtitle'),
+					hint = table.concat(hints, ', '),
+					value = {url = url, page = page},
+					keep_open = true,
+					actions = page and
+						{{name = 'open_in_browser', icon = 'open_in_new', label = t('Open in browser') .. ' (shift)'}} or nil,
+				}
+			end
+
+			local items = {}
+			for _, group in ipairs({{t('Hebrew'), he}, {t('English'), en}}) do
+				if #group[2] > 0 then
+					if #items > 0 then items[#items].separator = true end
+					items[#items + 1] = {title = group[1], bold = true, italic = true, muted = true, selectable = false}
+					for _, sub in ipairs(group[2]) do items[#items + 1] = release_item(sub) end
+				end
+			end
+
+			if #items == 0 then
+				items = {{title = t('no results'), align = 'center', muted = true, italic = true, selectable = false}}
+			end
+
+			menu:update_items(items)
+		end)
+	end
+
+	---@param value {url: string, page: string|nil}
+	handle_download = function(value)
+		menu = Menu:open({
+			type = menu_type .. '-result',
+			search_style = 'disabled',
+			items = {{icon = 'spinner', align = 'center', selectable = false, muted = true}},
+		}, function(event)
+			if event.type == 'key' and event.key == 'enter' then menu:close() end
+		end)
+
+		local zip_path = join_path(destination_directory, 'subdl-download.zip')
+
+		run_async({'curl', '-s', '-L', '-o', zip_path, value.url}, function(success, result, error)
+			if not menu or not menu:is_alive() then return end
+			if not success or not result or result.status ~= 0 then
+				report_error('Subtitle download failed', error or (result and result.stderr))
+				return
+			end
+
+			-- Extract verbosely so we can read which subtitle file came out of the archive.
+			-- Windows ships bsdtar (handles zip); elsewhere fall back to unzip.
+			local extract_args = state.platform == 'windows'
+				and {'tar', '-xvf', zip_path, '-C', destination_directory}
+				or {'unzip', '-o', zip_path, '-d', destination_directory}
+
+			run_async(extract_args, function(ok, res, err)
+				os.remove(zip_path)
+				if not menu or not menu:is_alive() then return end
+				if not ok or not res or res.status ~= 0 then
+					report_error('Could not extract subtitle archive', err or (res and res.stderr))
+					return
+				end
+
+				local out = (res.stdout or '') .. '\n' .. (res.stderr or '')
+				local files = {}
+				for line in out:gmatch('[^\r\n]+') do
+					local file = line:match('^x%s+(.+)$') or line:match('inflating:%s+(.+)$') or
+						line:match('extracting:%s+(.+)$')
+					if file then
+						file = trim(file)
+						if has_any_extension(file, config.types.subtitle) then files[#files + 1] = file end
+					end
+				end
+
+				if #files == 0 then
+					report_error('No subtitle file found in archive')
+					return
+				end
+
+				-- Prefer the file matching the currently playing episode, if any.
+				local chosen = files[1]
+				local current = mp.get_property_native('filename') or ''
+				local cs, ce = current:match('[Ss](%d%d?)[Ee](%d%d?)')
+				if cs and ce then
+					for _, file in ipairs(files) do
+						local fs, fe = file:match('[Ss](%d%d?)[Ee](%d%d?)')
+						if fs and fe and tonumber(fs) == tonumber(cs) and tonumber(fe) == tonumber(ce) then
+							chosen = file
+							break
+						end
+					end
+				end
+
+				local sub_path = join_path(destination_directory, chosen)
+				load_track('sub', sub_path)
+				local serialized = serialize_path(sub_path)
+				menu:update_items({
+					{title = t('Subtitles loaded & enabled'), bold = true, icon = 'check', selectable = false},
+					{
+						title = serialized and serialized.basename or chosen,
+						italic = true, muted = true, icon = 'subtitles', selectable = false,
+					},
+				})
+			end)
+		end)
+	end
+
+	local initial_items = {
+		{title = t('%s to search', 'enter'), align = 'center', muted = true, italic = true, selectable = false},
+	}
+
+	menu = Menu:open(
+		{
+			type = menu_type,
+			title = search_title,
+			items = initial_items,
+			search_style = 'palette',
+			on_search = 'callback',
+			search_debounce = 'submit',
+			search_suggestion = search_suggestion,
+			search_submit = search_suggestion and #search_suggestion > 0,
+		},
+		function(event)
+			if event.type == 'activate' then
+				local value = event.value
+				if type(value) == 'table' and value.open_url then
+					open_url(value.open_url)
+				elseif (event.action == 'open_in_browser' or event.modifiers == 'shift')
+					and type(value) == 'table' and value.page then
+					open_url(value.page)
+				elseif not event.action and type(value) == 'table' and value.url then
+					handle_download(value)
 				end
 			elseif event.type == 'search' then
 				handle_search(event.query)
