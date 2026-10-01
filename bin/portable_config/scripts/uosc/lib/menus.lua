@@ -921,7 +921,7 @@ function open_subtitle_downloader(opts)
 
 	if state.path then
 		if is_protocol(state.path) then
-			local title = mp.get_property_native('title')
+			local title = mp.get_property_native('media-title')
 			if title and not is_protocol(title) then search_suggestion = title end
 		else
 			local serialized_path = serialize_path(state.path)
@@ -1430,7 +1430,7 @@ function open_subdl_downloader()
 
 		local zip_path = join_path(destination_directory, 'subdl-download.zip')
 
-		run_async({'curl', '-s', '-L', '-o', zip_path, value.url}, function(success, result, error)
+		run_async({'curl', '-s', '-S', '-L', '-f', '--create-dirs', '-o', zip_path, value.url}, function(success, result, error)
 			if not menu or not menu:is_alive() then return end
 			if not success or not result or result.status ~= 0 then
 				report_error('Subtitle download failed', error or (result and result.stderr))
