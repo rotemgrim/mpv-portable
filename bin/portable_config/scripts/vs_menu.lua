@@ -20,7 +20,8 @@ end
 
 -- Parameter definitions: key, display name, type, min, max, step, options_list
 local params = {
-    { key="dst_fps",     name="Target FPS",        type="int",   min=24,  max=240, step=10,  desc="Output framerate. Match your monitor refresh rate" },
+    { key="dst_fps",     name="Target FPS",        type="choice", choices={"auto", 48, 60, 72, 90, 120, 144}, labels={"auto (display)","48","60","72","90","120","144"},  desc="Output framerate. auto = monitor refresh rate, capped at Auto FPS cap" },
+    { key="max_fps",     name="Auto FPS cap",       type="choice", choices={60, 72, 90, 120, 144, 165, 240}, labels={"60","72","90","120","144","165","240"},  desc="Highest rate auto picks. Lower it if the CPU can't keep up" },
     { key="pel",         name="Sub-pixel (pel)",    type="choice", choices={1, 2, 4}, labels={"1 (fast)","2 (quality)","4 (best)"},  desc="Sub-pixel accuracy. Higher = sharper motion, slower" },
     { key="sharp",       name="Sharp (super)",      type="int",   min=0,   max=2,   step=1,   desc="Sub-pixel sharpness. 0=soft 1=bilinear 2=wiener" },
     { key="blksize",     name="Block size",         type="choice", choices={4, 8, 16, 32, 64}, labels={"4","8","16","32 (fast)","64"},  desc="Smaller = finer detail, much slower" },
@@ -37,7 +38,8 @@ local params = {
     { key="ml",          name="Bad block mask",     type="float", min=0,   max=400,  step=10,  desc="Mask bad motion. Lower = stricter, fewer artifacts" },
     { key="threads",     name="Threads (0=auto)",   type="int",   min=0,   max=32,   step=1,   desc="CPU threads. 0 = use all available cores" },
     { key="_sep_rife",    name="─── RIFE AI (GPU) ───", type="separator" },
-    { key="rife_multi",   name="FPS multiplier",      type="choice", choices={2, 2.5, 3, 4}, labels={"2x","2.5x","3x","4x"},  desc="Multiply source FPS. 24fps x2 = 48fps, x2.5 = 60fps" },
+    { key="rife_multi",   name="FPS multiplier",      type="choice", choices={"auto", 2, 2.5, 3, 4}, labels={"auto (display)","2x","2.5x","3x","4x"},  desc="auto = match the monitor, capped at RIFE FPS cap. 24fps x2.5 = 60fps" },
+    { key="rife_max_fps", name="RIFE FPS cap",        type="choice", choices={48, 60, 72, 90, 120}, labels={"48","60","72","90","120"},  desc="Highest rate auto picks for RIFE. ~75 fps is the 1080p limit" },
     { key="rife_model",   name="Model version",       type="choice", choices={46, 410}, labels={"v4.6","v4.10"},  desc="v4.6 = fast & compatible. v4.10 = newer, better quality" },
     { key="rife_streams", name="GPU streams",         type="int",   min=1,   max=8,   step=1,   desc="Parallel GPU work. More = faster but more VRAM" },
     { key="rife_fp16",    name="Half precision",      type="choice", choices={0, 1}, labels={"off (accurate)","on (fast)"},  desc="FP16 uses less VRAM and is faster. Minimal quality loss" },
@@ -46,20 +48,20 @@ local params = {
 
 -- Default values
 local defaults = {
-    dst_fps=60, pel=1, sharp=2, blksize=32, overlap=0,
+    dst_fps="auto", max_fps=120, pel=1, sharp=2, blksize=32, overlap=0,
     search=2, searchparam=2, truemotion=1, dct=0,
     mode=3, blend=1, thscd1=400, thscd2=130, ml=100.0,
-    use_flow=0, threads=4,
-    rife_multi=2, rife_model=46, rife_streams=2, rife_fp16=1, rife_ensemble=0
+    use_flow=0, threads=0,
+    rife_multi="auto", rife_max_fps=60, rife_model=46, rife_streams=2, rife_fp16=1, rife_ensemble=0
 }
 
 -- 4K preset: lightweight settings for high-res video
 local preset_4k = {
-    dst_fps=60, pel=1, sharp=2, blksize=64, overlap=0,
+    dst_fps="auto", max_fps=120, pel=1, sharp=2, blksize=64, overlap=0,
     search=1, searchparam=1, truemotion=1, dct=0,
     mode=3, blend=1, thscd1=400, thscd2=130, ml=100.0,
     use_flow=0, threads=0,
-    rife_multi=2, rife_model=46, rife_streams=1, rife_fp16=1, rife_ensemble=0
+    rife_multi="auto", rife_max_fps=60, rife_model=46, rife_streams=1, rife_fp16=1, rife_ensemble=0
 }
 
 -- Current values
@@ -208,15 +210,15 @@ local function apply_and_reload()
     -- Check if vapoursynth filter is active, reload it
     local vf = mp.get_property_native("vf")
     local found = false
-    local found_filter = nil
+    local found_mode = nil
     for i, f in ipairs(vf) do
         if f.name == "vapoursynth" then
             found = true
             -- Detect which script is active
             if f.params and f.params.file and f.params.file:find("rife") then
-                found_filter = 'vapoursynth="~~/rife.vpy":buffered-frames=4:concurrent-frames=4'
+                found_mode = "rife"
             else
-                found_filter = 'vapoursynth="~~/motion.vpy":buffered-frames=4:concurrent-frames=4'
+                found_mode = "motion"
             end
             break
         end
@@ -224,11 +226,10 @@ local function apply_and_reload()
 
     if found then
         -- Fully remove then re-add to force a clean reinit
-        local vf_str = found_filter
         mp.command("no-osd vf clr \"\"")
         -- Small delay via timer to let the old filter fully tear down
         mp.add_timeout(0.3, function()
-            mp.command("no-osd vf set " .. vf_str)
+            mp.commandv("script-message", "vs-mode", found_mode)
             mp.osd_message("Config applied & reloaded", 2)
         end)
     else

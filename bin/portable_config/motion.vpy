@@ -1,7 +1,11 @@
 import vapoursynth as vs
 import os
+import sys
 
 core = vs.core
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from vs_fps import assume_source_fps, target_fps
 
 # Load config from vs_config.conf next to this script
 config = {}
@@ -25,7 +29,8 @@ def cfg_float(key, default):
     except: return default
 
 # Read all parameters
-dst_fps     = cfg_int("dst_fps", 60)
+dst_fps     = config.get("dst_fps", "auto")  # "auto" follows the display
+max_fps     = cfg_float("max_fps", 120)    # cap for auto
 pel         = cfg_int("pel", 1)
 sharp       = cfg_int("sharp", 2)
 blksize     = cfg_int("blksize", 32)
@@ -47,25 +52,27 @@ if threads > 0:
 
 clip = video_in
 
-# Assume source FPS if not set
-if clip.fps.numerator == 0:
-    clip = core.std.AssumeFPS(clip, fpsnum=24000, fpsden=1001)
+# mpv leaves video_in.fps at 0; take the rate from container_fps
+clip = assume_source_fps(core, clip, globals().get("container_fps", 0))
+dst = target_fps(dst_fps, globals().get("display_fps", 0), max_fps)
 
-sup = core.mv.Super(clip, pel=pel, sharp=sharp)
-bvec = core.mv.Analyse(sup, isb=True, blksize=blksize, overlap=overlap,
-                        search=search, searchparam=searchparam,
-                        truemotion=truemotion, dct=dct)
-fvec = core.mv.Analyse(sup, isb=False, blksize=blksize, overlap=overlap,
-                        search=search, searchparam=searchparam,
-                        truemotion=truemotion, dct=dct)
+# Nothing to interpolate when the source is already at or above the target
+if dst > clip.fps:
+    sup = core.mv.Super(clip, pel=pel, sharp=sharp)
+    bvec = core.mv.Analyse(sup, isb=True, blksize=blksize, overlap=overlap,
+                            search=search, searchparam=searchparam,
+                            truemotion=truemotion, dct=dct)
+    fvec = core.mv.Analyse(sup, isb=False, blksize=blksize, overlap=overlap,
+                            search=search, searchparam=searchparam,
+                            truemotion=truemotion, dct=dct)
 
-if use_flow:
-    clip = core.mv.FlowFPS(clip, sup, bvec, fvec,
-                            num=dst_fps, den=1,
-                            blend=blend, thscd1=thscd1, thscd2=thscd2, ml=ml)
-else:
-    clip = core.mv.BlockFPS(clip, sup, bvec, fvec,
-                             num=dst_fps, den=1, mode=mode,
-                             blend=blend, thscd1=thscd1, thscd2=thscd2, ml=ml)
+    if use_flow:
+        clip = core.mv.FlowFPS(clip, sup, bvec, fvec,
+                                num=dst.numerator, den=dst.denominator,
+                                blend=blend, thscd1=thscd1, thscd2=thscd2, ml=ml)
+    else:
+        clip = core.mv.BlockFPS(clip, sup, bvec, fvec,
+                                 num=dst.numerator, den=dst.denominator, mode=mode,
+                                 blend=blend, thscd1=thscd1, thscd2=thscd2, ml=ml)
 
 clip.set_output()

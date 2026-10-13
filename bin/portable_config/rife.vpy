@@ -11,6 +11,10 @@ if site_packages not in sys.path:
     sys.path.insert(0, site_packages)
 
 import vsmlrt
+from fractions import Fraction
+
+sys.path.insert(0, script_dir)
+from vs_fps import assume_source_fps, target_fps
 
 # Load config
 config = {}
@@ -33,7 +37,8 @@ def cfg_float(key, default):
     try: return float(config.get(key, default))
     except: return default
 
-rife_multi    = cfg_float("rife_multi", 2)
+rife_multi    = config.get("rife_multi", "auto")  # "auto" follows the display
+rife_max_fps  = cfg_float("rife_max_fps", 60)     # cap for auto
 rife_model_id = cfg_int("rife_model", 46)
 rife_streams  = cfg_int("rife_streams", 2)
 rife_fp16     = cfg_int("rife_fp16", 1)
@@ -45,9 +50,15 @@ rife_model = model_map.get(rife_model_id, vsmlrt.RIFEModel.v4_6)
 
 clip = video_in
 
-# Assume source FPS if not set
-if clip.fps.numerator == 0:
-    clip = core.std.AssumeFPS(clip, fpsnum=24000, fpsden=1001)
+# mpv leaves video_in.fps at 0; take the rate from container_fps
+clip = assume_source_fps(core, clip, globals().get("container_fps", 0))
+
+# Fraction multipliers (e.g. 2.5) are supported; "auto" makes the output hit
+# the display rate, or the largest even fraction of it within rife_max_fps
+if str(rife_multi).strip().lower() == "auto":
+    multi = target_fps("auto", globals().get("display_fps", 0), rife_max_fps) / clip.fps
+else:
+    multi = Fraction(str(rife_multi)).limit_denominator(10)
 
 # RIFE needs RGB input
 orig_w = clip.width
@@ -60,11 +71,6 @@ if pad_w or pad_h:
     clip = core.std.AddBorders(clip, right=pad_w, bottom=pad_h)
 
 clip_rgb = core.resize.Bicubic(clip, format=vs.RGBS, matrix_in_s="709")
-
-from fractions import Fraction
-
-# Convert multi to Fraction for RIFE (supports 2.5 etc)
-rife_multi_frac = Fraction(rife_multi).limit_denominator(10)
 
 # Backend preference: TRT_RTX (fastest on RTX, native Blackwell support)
 # > ORT_CUDA > ORT_DML (any GPU vendor).
@@ -106,14 +112,16 @@ else:
         fp16=bool(rife_fp16),
     )
 
-clip_rgb = vsmlrt.RIFE(
-    clip_rgb,
-    multi=rife_multi_frac,
-    model=rife_model,
-    backend=backend,
-    ensemble=bool(rife_ensemble),
-    video_player=True,
-)
+# Nothing to interpolate when the source is already at or above the target
+if multi > 1:
+    clip_rgb = vsmlrt.RIFE(
+        clip_rgb,
+        multi=multi,
+        model=rife_model,
+        backend=backend,
+        ensemble=bool(rife_ensemble),
+        video_player=True,
+    )
 
 # Convert back to original format and crop padding
 clip = core.resize.Bicubic(clip_rgb, format=clip.format.id if clip.format else vs.YUV420P8, matrix_s="709")
