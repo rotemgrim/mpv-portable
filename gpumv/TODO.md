@@ -5,7 +5,7 @@ Ordered by impact on everyday movie watching, most impactful first.
 ## To do
 
 1. [ ] **Publish the release payload** with `gpumv.dll`: run `tools\build-payload.ps1` (uploads to the `payload` release). CI already excludes the `gpumv/` source folder from the package
-2. [ ] **Anime quality**: MVTools still scores about 0.7 dB higher on the two anime scenes. Try bigger blocks or stronger coherence for flat, line-art content (both anime scenes favour MVTools' 32 px blocks)
+2. [ ] **Detect animation automatically** and switch to the anime settings, instead of Ctrl+9. Held frames alone aren't enough (one of the two anime test scenes has none)
 3. [ ] **Interpolation strength / film look**: setting that keeps some of the original cadence, for people who dislike the soap-opera effect
 4. [ ] **Fast action and motion blur**: fall back to blending where blur makes matching unreliable (very fast pans now work up to a quarter of the frame width per frame pair)
 5. [ ] **NVIDIA optical-flow hardware**: confirm the RTX 5080 has it (probe program with NVIDIA's public SDK headers), then try it for motion vectors like SVP's `SmoothFps_NVOF`
@@ -29,6 +29,7 @@ Ordered by impact on everyday movie watching, most impactful first.
 
 ## Done
 
+- [x] **Anime quality**: Ctrl+9 preset (32 px blocks, lambda 2.0, mask 1.0) beats MVTools on the anime scenes (34.23 vs 34.15 dB, worst frames 30.04 vs 28.03 on one); live action keeps Ctrl+8, where these settings would cost up to 3.4 dB
 - [x] **Letterbox bars** (`bars`): detected in matching pairs and held for half a second before use; bars stay exactly black, picture next to them improves, no false detections on clips without bars
 - [x] **Static overlays**: adaptive mode keeps burned-in subtitles intact (+3 to +6 dB over flow mode); the extra `static` rule added nothing and is off
 - [x] **Real movie test set**: `test/testset.py` over 10 scenes from 5 films; gpumv adaptive beats MVTools by 1.3 dB on average

@@ -6,8 +6,24 @@ and adds an adaptive mode plus handling for letterbox bars, fades, fast camera p
 drawn on twos. Ideas taken from SVP come from its documentation, forum and public parameter names;
 no SVP code is used.
 
-In mpv: **Ctrl+8** (settings `gpumv_*` in `bin/portable_config/vs_config.conf`, plus the shared
-`dst_fps`, `max_fps`, `pel`, `thscd1`, `thscd2`, `ml`).
+In mpv: **Ctrl+8**, or **Ctrl+9** for animation (settings `gpumv_*` and `gpumv_anime_*` in
+`bin/portable_config/vs_config.conf`, plus the shared `dst_fps`, `max_fps`, `pel`, `thscd1`,
+`thscd2`, `ml`).
+
+### Live action and animation
+
+The two want opposite settings, so they are separate modes:
+
+| | Ctrl+8 (default) | Ctrl+9 (anime) |
+|---|---|---|
+| `blksize` | 16 | 32 |
+| `lambda` | 0.1 | 2.0 |
+| `mask` | 0.5 | 1.0 |
+| Live-action scenes (8) | best | up to 3.4 dB worse |
+| Anime scenes (2), vs MVTools 34.15 dB | 33.37 dB | 34.23 dB |
+
+Flat line art matches equally well almost anywhere, so it needs a much more coherent vector
+field; live action has real, varied motion that strong coherence smooths away.
 
 ## Build
 
@@ -100,7 +116,8 @@ Run with the portable `bin\python.exe`. Most take a raw 8-bit YUV420 clip, drop 
 rebuild it and score luma PSNR against the frames that were dropped.
 
 - `test\quality.py <clip.yuv> <w> <h> [methods] [key=value]`: the basic comparison.
-  `mv.<key>=<value>` changes an MVTools setting, anything else a gpumv one
+  `mv.<key>=<value>` changes an MVTools setting, anything else a gpumv one. `skipheld=1` leaves out
+  dropped frames that copy a neighbour (animation on twos), where not moving scores best
 - `test\testset.py <work dir> [methods] [key=value]`: the same over the real-film scenes listed in
   `test\testset.txt` (extracted once into the work dir)
 - `test\scenes.py <a.yuv> <b.yuv> <w> <h>`: a hard cut, normal and darkened

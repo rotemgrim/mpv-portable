@@ -218,6 +218,8 @@ local function apply_and_reload()
             local file = f.params and f.params.file or ""
             if file:find("rife") then
                 found_mode = "rife"
+            elseif file:find("gpumv_anime") then
+                found_mode = "gpumv_anime"
             elseif file:find("gpumv") then
                 found_mode = "gpumv"
             elseif file:find("svp") then

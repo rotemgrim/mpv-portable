@@ -32,6 +32,13 @@ def cfg_float(key, default):
 dst_fps = config.get("dst_fps", "auto")
 max_fps = cfg_float("max_fps", 120)
 
+# gpumv_anime.vpy (Ctrl+9) runs this script with ANIME set: flat line art wants
+# bigger blocks and a more coherent vector field than live action
+anime = globals().get("ANIME", False)
+tuned = (("gpumv_anime_blksize", 32), ("gpumv_anime_lambda", 2.0), ("gpumv_anime_mask", 1.0)) if anime else \
+        (("gpumv_blksize", 16), ("gpumv_lambda", 0.1), ("gpumv_mask", 0.5))
+blksize, lam, mask = cfg_int(*tuned[0]), cfg_float(*tuned[1]), cfg_float(*tuned[2])
+
 clip = video_in
 
 # mpv leaves video_in.fps at 0; take the rate from container_fps
@@ -43,13 +50,14 @@ if dst > clip.fps:
     clip = core.gpumv.Interpolate(
         clip, num=dst.numerator, den=dst.denominator,
         mode=cfg_int("gpumv_mode", 2),
-        blksize=cfg_int("gpumv_blksize", 16),
+        blksize=blksize,
+        lambda_=lam,
         pel=cfg_int("pel", 1),
         blend=cfg_int("gpumv_blend", 0),
         thscd1=cfg_int("thscd1", 400),
         thscd2=cfg_int("thscd2", 130),
         ml=cfg_float("ml", 100.0),
-        mask=cfg_float("gpumv_mask", 0.5),
+        mask=mask,
         dedup=cfg_int("gpumv_dedup", 1),
     )
 

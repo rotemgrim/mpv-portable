@@ -9,6 +9,8 @@ the real ones (luma PSNR, higher is better).
 Methods: repeat, blend, mvtools, gpumv-block, gpumv-flow, gpumv-adaptive (default: all).
 MVTools and gpumv read their settings from portable_config/vs_config.conf.
 Extra gpumv settings can be given as key=value, e.g. lambda=0.2 blksize=16.
+skipheld=1 leaves out dropped frames that are copies of a neighbour (animation
+drawn on twos): the best score there goes to not moving, not to good motion.
 """
 import ctypes
 import math
@@ -27,6 +29,7 @@ overrides = dict(a.split("=", 1) for a in args if "=" in a)
 # mv.<key>=<value> overrides an MVTools setting, everything else a gpumv one
 mv_overrides = {k[3:]: v for k, v in overrides.items() if k.startswith("mv.")}
 overrides = {k: v for k, v in overrides.items() if not k.startswith("mv.")}
+skipheld = overrides.pop("skipheld", "0") == "1"
 
 frame_size = w * h * 3 // 2
 fh = open(path, "rb")
@@ -98,16 +101,38 @@ def psnr_scores(out):
     got = core.std.ShufflePlanes(got, 0, vs.GRAY)
     ref = core.std.ShufflePlanes(ref, 0, vs.GRAY)
     sq = core.std.Expr([got, ref], "x y - dup *", format=vs.GRAYS).std.PlaneStats()
+    keep = held_mask(count) if skipheld else [True] * count
     scores = []
-    for fr in sq.frames():
+    for i, fr in enumerate(sq.frames()):
+        if not keep[i]:
+            continue
         mse = fr.props["PlaneStatsAverage"]
         scores.append(99.0 if mse <= 1e-10 else 10 * math.log10(255 * 255 / mse))
     return scores
 
 
+_held = None
+
+
+def held_mask(count):
+    # Dropped frame 2k+1 is kept unless it matches frame 2k or 2k+2 (quarter
+    # resolution, mean difference under 0.4)
+    global _held
+    if _held is None:
+        y = core.std.ShufflePlanes(full, 0, vs.GRAY).resize.Bilinear(w // 4, h // 4)
+        mid, prev, nxt = y.std.SelectEvery(2, 1)[:count], y.std.SelectEvery(2, 0)[:count], y.std.SelectEvery(2, 0)[1:count + 1]
+        dp = core.std.Expr([mid, prev], "x y - abs", format=vs.GRAYS).std.PlaneStats()
+        dn = core.std.Expr([mid, nxt], "x y - abs", format=vs.GRAYS).std.PlaneStats()
+        _held = [min(a.props["PlaneStatsAverage"], b.props["PlaneStatsAverage"]) >= 0.4
+                 for a, b in zip(dp.frames(), dn.frames())]
+    return _held
+
+
 if __name__ == "__main__":
     print(f"{num_frames} frames {w}x{h}, settings: blksize={config.get('blksize')} pel={config.get('pel')} "
           f"mode={config.get('mode')} use_flow={config.get('use_flow')} {mv_overrides or ''} {overrides or ''}")
+    if skipheld:
+        print(f"skipping {held_mask(num_frames // 2 - 1).count(False)} held frames")
     print(f"{'method':<12} {'mean PSNR':>9} {'worst 10%':>9} {'min':>6}")
     for m in methods:
         s = sorted(psnr_scores(build[m](half)))
