@@ -6,7 +6,9 @@ and adds an adaptive mode plus handling for letterbox bars, fades, fast camera p
 drawn on twos. Ideas taken from SVP come from its documentation, forum and public parameter names;
 no SVP code is used.
 
-In mpv: **Ctrl+8**, or **Ctrl+9** for animation (settings `gpumv_*` and `gpumv_anime_*` in
+In mpv: **Ctrl+G** opens the motion smoothing settings window (also in the right-click menu under
+Interpolation): mode, smoothness, quality and the extras, in plain words, applied to the playing
+video at once, with a live status line. Or use **Ctrl+8**, and **Ctrl+9** for animation (settings `gpumv_*` and `gpumv_anime_*` in
 `bin/portable_config/vs_config.conf`, plus the shared `dst_fps`, `max_fps`, `pel`, `thscd1`,
 `thscd2`, `ml`).
 
@@ -23,7 +25,9 @@ The two want opposite settings, so they are separate modes:
 | Anime scenes (2), vs MVTools 34.15 dB | 33.37 dB | 34.23 dB |
 
 Flat line art matches equally well almost anywhere, so it needs a much more coherent vector
-field; live action has real, varied motion that strong coherence smooths away.
+field; live action has real, varied motion that strong coherence smooths away. Choosing the
+coherence per block by texture (`lambdaflat`) doesn't replace the two modes: live action's
+motion blur, soft backgrounds and dark areas look as flat as anime's colour fills.
 
 ## Build
 
@@ -42,7 +46,8 @@ whole plugins folder.
 
 ```
 gpumv.Interpolate(clip clip, int num[, int den=1, int mode=2, int blksize=16, int pel=1,
-                  int radius=4, int refine=2, float lambda=0.1, int smooth=1, int split=0,
+                  int radius=4, int refine=2, float lambda=0.1, float lambdaflat=0, float texref=4,
+                  int smooth=1, int split=0,
                   int thsad=250, int gmv=1, int temporal=1, int blend=0, int thscd1=400,
                   int thscd2=130, float scratio=3, float ml=100, float mask=0.5, float occsad=2,
                   int bars=1, float barsth=24, float static=0, int fades=1, int prefilter=0,
@@ -55,6 +60,9 @@ gpumv.Interpolate(clip clip, int num[, int den=1, int mode=2, int blksize=16, in
 - `blksize`: 8, 16 or 32; `pel`: 1, or 2 for half-pel refinement
 - `radius`: exhaustive search radius at the coarsest pyramid level; `refine`: local search radius below it
 - `lambda`: vector coherence penalty; `smooth`: 3x3 vector median
+- `lambdaflat`, `texref`: per-block coherence, growing from `lambda` towards `lambdaflat` in blocks
+  whose texture (8-bit mean deviation) is below `texref`. Off: it can't tell anime's flat colour
+  from live action's blur and soft backgrounds, and cost live action up to 2.5 dB
 - `split`: times a block whose match error is above `thsad` (8x8-block SAD, 8-bit) is split in four
   and searched again, like SVP's `refine`. Off: no gain measured
 - `gmv`: camera motion. The best whole-frame shift at the coarsest level, up to a quarter of the

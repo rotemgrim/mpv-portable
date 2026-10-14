@@ -59,6 +59,8 @@ if dst > clip.fps:
         ml=cfg_float("ml", 100.0),
         mask=mask,
         dedup=cfg_int("gpumv_dedup", 1),
+        bars=cfg_int("gpumv_bars", 1),
+        fades=cfg_int("gpumv_fades", 1),
     )
 
 clip.set_output()

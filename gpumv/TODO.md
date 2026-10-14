@@ -29,6 +29,8 @@ Ordered by impact on everyday movie watching, most impactful first.
 
 ## Done
 
+- [x] **Settings window** (Ctrl+G, `smoothing-settings.ps1`): WPF window talking to mpv over its IPC pipe; replaces the old Ctrl+M text menu
+- [x] **Per-block coherence by texture** (`lambdaflat`), to replace the two modes: tried, off. It hurts live action (blur and soft backgrounds look flat) before it helps anime enough
 - [x] **Anime quality**: Ctrl+9 preset (32 px blocks, lambda 2.0, mask 1.0) beats MVTools on the anime scenes (34.23 vs 34.15 dB, worst frames 30.04 vs 28.03 on one); live action keeps Ctrl+8, where these settings would cost up to 3.4 dB
 - [x] **Letterbox bars** (`bars`): detected in matching pairs and held for half a second before use; bars stay exactly black, picture next to them improves, no false detections on clips without bars
 - [x] **Static overlays**: adaptive mode keeps burned-in subtitles intact (+3 to +6 dB over flow mode); the extra `static` rule added nothing and is off

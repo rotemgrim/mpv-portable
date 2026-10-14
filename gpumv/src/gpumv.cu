@@ -11,7 +11,10 @@
 //      B->A backward). The coarsest level does an exhaustive search; finer
 //      levels try the upscaled parent vector, its neighbours and zero, then
 //      refine locally. Cost = mean SAD + lambda * |v - parent| (coherence,
-//      the job MVTools' truemotion does).
+//      the job MVTools' truemotion does). With lambdaflat set, lambda grows
+//      towards it in flat blocks, where any vector matches about as well
+//      (flat colour in animation, sky, walls) and only coherence picks the
+//      right one; textured blocks keep the plain lambda.
 //   3. Optional 3x3 vector median and an occlusion mask per direction: blocks
 //      whose best match is still poor, or where vectors converge.
 //   4. Letterbox bars: rows and columns from the edges that stay dark in both
@@ -74,6 +77,8 @@ struct Params {
     int radius = 4;      // exhaustive search radius at the coarsest level
     int refine = 2;      // local refinement radius at finer levels
     float lambda = 0.1f;
+    float lambdaflat = 0.f;  // coherence in flat blocks (0 = same as lambda everywhere)
+    float texref = 4.f;      // block texture (8-bit mean deviation) halfway between the two
     int smooth = 1;      // 3x3 median on the full-resolution vectors
     int split = 0;       // times a badly matched block is split in four and searched again
     int thsad = 250;     // SAD of an 8x8 block (8-bit) above which a block is split
@@ -226,7 +231,8 @@ __global__ void motion_search(const float* __restrict__ cur, const float* __rest
                               int pitch, int nbx, int nby, const float2* __restrict__ parent,
                               const float* __restrict__ parent_sad, int pnbx, int pnby, float pscale, float gate,
                               const float2* __restrict__ prior, float2 global, int use_global, int radius,
-                              int refine, float lambda, int halfpel, Gain gain, float2* __restrict__ outv,
+                              int refine, float lambda, float lambdaflat, float texref, int halfpel, Gain gain,
+                              float2* __restrict__ outv,
                               float* __restrict__ outsad) {
     constexpr int NP = BS * BS / 32;
     const int lane = threadIdx.x;
@@ -249,6 +255,20 @@ __global__ void motion_search(const float* __restrict__ cur, const float* __rest
         valid += in[k] ? 1.f : 0.f;
     }
     const float inv_n = 1.f / fmaxf(warp_sum(valid), 1.f);
+
+    // Texture of the block: mean absolute deviation from its mean
+    float lam = lambda;
+    if (lambdaflat > lambda) {
+        float sum = 0.f;
+#pragma unroll
+        for (int k = 0; k < NP; k++) sum += in[k] ? c[k] : 0.f;
+        const float mean = warp_sum(sum) * inv_n;
+        float dev = 0.f;
+#pragma unroll
+        for (int k = 0; k < NP; k++) dev += in[k] ? fabsf(c[k] - mean) : 0.f;
+        dev = warp_sum(dev) * inv_n;
+        lam = lambda + (lambdaflat - lambda) * texref / (texref + dev);
+    }
 
     auto sad_int = [&](int vx, int vy) {
         float s = 0.f;
@@ -285,7 +305,7 @@ __global__ void motion_search(const float* __restrict__ cur, const float* __rest
             return;
         }
     }
-    auto penalty = [&](float vx, float vy) { return lambda * (fabsf(vx - pred.x) + fabsf(vy - pred.y)); };
+    auto penalty = [&](float vx, float vy) { return lam * (fabsf(vx - pred.x) + fabsf(vy - pred.y)); };
 
     int best_x = 0, best_y = 0;
     float best_sad = sad_int(0, 0);
@@ -1130,6 +1150,7 @@ private:
 #define LAUNCH(BS)                                                                                            \
     motion_search<BS><<<grid, blk, 0, stream_>>>(cur, ref, ar, pitch, nbx, nby, parent, psad, pnbx, pnby, pscale, \
                                                  gate, prior, global, use_global, radius, refine, p_.lambda,   \
+                                                 p_.lambdaflat, p_.texref,                                     \
                                                  halfpel, gain, out, sad)
         if (bs == 8)
             LAUNCH(8);
@@ -1380,6 +1401,8 @@ static void VS_CC interp_create(const VSMap* in, VSMap* out, void*, VSCore* core
     p.radius = geti("radius", p.radius);
     p.refine = geti("refine", p.refine);
     p.lambda = getf("lambda", p.lambda);
+    p.lambdaflat = getf("lambdaflat", p.lambdaflat);
+    p.texref = getf("texref", p.texref);
     p.smooth = geti("smooth", p.smooth);
     p.split = geti("split", p.split);
     p.thsad = geti("thsad", p.thsad);
@@ -1434,10 +1457,10 @@ static void VS_CC interp_create(const VSMap* in, VSMap* out, void*, VSCore* core
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI* vspapi) {
     vspapi->configPlugin("com.mpv-portable.gpumv", "gpumv", "GPU motion-compensated frame interpolation",
-                         VS_MAKE_VERSION(0, 8), VAPOURSYNTH_API_VERSION, 0, plugin);
+                         VS_MAKE_VERSION(0, 9), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction("Interpolate",
                              "clip:vnode;num:int;den:int:opt;mode:int:opt;blksize:int:opt;pel:int:opt;radius:int:opt;"
-                             "refine:int:opt;lambda:float:opt;smooth:int:opt;split:int:opt;thsad:int:opt;gmv:int:opt;temporal:int:opt;blend:int:opt;thscd1:int:opt;"
+                             "refine:int:opt;lambda:float:opt;lambdaflat:float:opt;texref:float:opt;smooth:int:opt;split:int:opt;thsad:int:opt;gmv:int:opt;temporal:int:opt;blend:int:opt;thscd1:int:opt;"
                              "thscd2:int:opt;scratio:float:opt;ml:float:opt;mask:float:opt;occsad:float:opt;bars:int:opt;barsth:float:opt;static:float:opt;fades:int:opt;prefilter:int:opt;dedup:int:opt;holdmax:int:opt;dupth:float:opt;device:int:opt;",
                              "clip:vnode;", interp_create, nullptr, plugin);
 }
