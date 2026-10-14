@@ -75,12 +75,22 @@ def mvtools(clip):
     return core.mv.BlockFPS(clip, sup, bv, fv, num=60, den=1, mode=ci("mode", 3), **sc)
 
 
+# GPUMV_DEV=<path to a test build>: load it next to the installed plugin (built
+# with build.cmd dev while mpv has the installed one open) and use it instead
+_dev = os.environ.get("GPUMV_DEV")
+if _dev:
+    core.std.LoadPlugin(_dev)
+    plugin = core.gpumvdev
+else:
+    plugin = core.gpumv
+
+
 def gpumv(clip, mode):
     p = dict(mode=mode, blksize=min(ci("blksize", 16), 32), pel=ci("pel", 1), blend=ci("blend", 1),
              thscd1=ci("thscd1", 400), thscd2=ci("thscd2", 130), ml=cf("ml", 100))
     for k, v in overrides.items():
         p["lambda_" if k == "lambda" else k] = float(v) if "." in v else int(v)
-    return core.gpumv.Interpolate(clip, num=60, den=1, **p)
+    return plugin.Interpolate(clip, num=60, den=1, **p)
 
 
 build = {

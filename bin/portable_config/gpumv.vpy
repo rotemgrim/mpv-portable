@@ -49,8 +49,7 @@ dst = target_fps(dst_fps, globals().get("display_fps", 0), max_fps)
 
 # Nothing to interpolate when the source is already at or above the target
 if dst > clip.fps:
-    clip = core.gpumv.Interpolate(
-        clip, num=dst.numerator, den=dst.denominator,
+    settings = dict(
         mode=cfg_int("gpumv_mode", 2),
         blksize=blksize,
         lambda_=lam,
@@ -64,7 +63,14 @@ if dst > clip.fps:
         bars=cfg_int("gpumv_bars", 1),
         fades=cfg_int("gpumv_fades", 1),
         nvof=nvof,
+        pnew=cfg_float("gpumv_anime_pnew", 100.0) if anime else 0.0,
+        satd=cfg_int("gpumv_anime_satd", 1) if anime else 0,
         strength=cfg_float("gpumv_strength", 1.0),
     )
+    # Pass only what the installed plugin knows, so a newer config keeps working
+    # with an older gpumv.dll (e.g. one still open in mpv while a new one is built)
+    known = {a.split(":")[0] for a in core.gpumv.Interpolate.signature.split(";") if a}
+    settings = {k: v for k, v in settings.items() if k.rstrip("_") in known}
+    clip = core.gpumv.Interpolate(clip, num=dst.numerator, den=dst.denominator, **settings)
 
 clip.set_output()

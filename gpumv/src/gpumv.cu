@@ -26,6 +26,9 @@
 //   6. Scene change: the thscd1/thscd2 block count, or the pair's mean match
 //      error spiking against the neighbouring pairs (catches dark cuts the
 //      fixed thresholds miss). Cuts show the nearest real frame.
+// Camera motion (gmv): a whole-frame shift search at the coarsest level, then
+// (zoom=1) a fit of shift + zoom + rotation to each coarse level's vectors, so
+// every block gets the camera's motion at its own position as a candidate.
 // Motion source (nvof): instead of the block search, NVIDIA's optical-flow
 // hardware (NVOFA, Turing and later) can supply the vectors, one per 4x4
 // pixels in both directions; everything after the search stays the same.
@@ -55,6 +58,7 @@
 #include <cstring>
 #include <memory>
 #include <map>
+#include <vector>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -62,6 +66,12 @@
 #include "VSHelper4.h"
 #include "nvOpticalFlowCuda.h"
 #include "VapourSynth4.h"
+
+// A test build can use another name, to load next to the installed plugin
+#ifndef GPUMV_NS
+#define GPUMV_NS "gpumv"
+#define GPUMV_ID "com.mpv-portable.gpumv"
+#endif
 
 #define CK(x)                                                                                 \
     do {                                                                                      \
@@ -76,7 +86,8 @@ static constexpr int kPairs = 4;   // motion fields kept on the GPU (previous, c
 static constexpr int kTile = 8;   // adaptive mode vector tile, in luma pixels
 static constexpr int kMaxSplit = 2;
 static constexpr int kGlobalRadius = 32;  // most camera motion search range at the coarsest level
-static constexpr int kBarsHold = 12;  // frame pairs new letterbox bars must hold before they are used
+static constexpr int kBarsHold = 12;
+static constexpr int kFitMax = 8192;  // most blocks a level may have for the camera motion fit  // frame pairs new letterbox bars must hold before they are used
 
 struct Params {
     int mode = 2;        // 0 block (BlockFPS-like), 1 flow (FlowFPS-like), 2 adaptive
@@ -92,6 +103,15 @@ struct Params {
     int thsad = 250;     // SAD of an 8x8 block (8-bit) above which a block is split
     int gmv = 1;         // try the frame's global (camera) motion as a candidate
     int temporal = 1;    // try the block's vector from the previous frame pair
+    int zoom = 1;        // fit zoom and rotation into the camera motion (needs gmv)
+    int lsad = 0;        // 8x8-block SAD of the predictor above which coherence weakens (0 = off)
+    float plevel = 1.f;  // coherence scale per pyramid level (1 = same on every level)
+    float pnew = 0.f;    // extra cost for searched vectors, /256
+    float pzero = 0.f;   // extra cost for the zero vector, /256
+    int badsad = 0;      // coarsest level: 8x8-block SAD above which a block searches further (0 = off)
+    int badrange = 0;    // ...out to this radius (coarsest-level pixels)
+    int trymany = 0;     // refine around every predictor
+    int satd = 0;        // rank candidates by SATD instead of SAD
     int blend = 0;       // scene change: blend (1) or show the nearest frame (0)
     int thscd1 = 400;    // SAD of an 8x8 block (8-bit) above which it changed
     int thscd2 = 130;    // changed blocks, out of 255, for a scene change
@@ -164,6 +184,29 @@ __global__ void downscale2(const float* __restrict__ src, int sw, int sh, int sp
 struct Area {
     int x0, y0, x1, y1;
 };
+
+// Finer search options, after MVTools' (and SVP's) options of the same names
+struct SearchOpts {
+    float lsad;      // predictor match error (per pixel) above which the coherence pull weakens
+    float plevel;    // coherence scale per pyramid level: lambda * plevel^level
+    float pnew;      // extra relative cost for searched (non-predicted) vectors, /256
+    float pzero;     // extra relative cost for the zero vector, /256
+    float badsad;    // coarsest level: blocks still matching worse than this (per pixel)...
+    int badrange;    // ...are searched again this far out
+    int trymany;     // refine around every predictor, not only the best
+    int satd;        // compare blocks by Hadamard-transformed difference (SATD) instead of SAD
+    int level;       // pyramid level being searched
+};
+
+// Camera motion at a level: shift, zoom (s) and rotation (r) around (cx, cy)
+struct Camera {
+    float tx, ty, s, r, cx, cy;
+};
+
+__device__ __forceinline__ float2 camera_at(const Camera& c, float x, float y) {
+    const float dx = x - c.cx, dy = y - c.cy;
+    return make_float2(c.tx + c.s * dx - c.r * dy, c.ty + c.s * dy + c.r * dx);
+}
 
 // Brightness of the current frame mapped onto the reference: v * gain + offset
 struct Gain {
@@ -274,9 +317,9 @@ template <int BS>
 __global__ void motion_search(const float* __restrict__ cur, const float* __restrict__ ref, Area ar,
                               int pitch, int nbx, int nby, const float2* __restrict__ parent,
                               const float* __restrict__ parent_sad, int pnbx, int pnby, float pscale, float gate,
-                              const float2* __restrict__ prior, float2 global, int use_global, int radius,
+                              const float2* __restrict__ prior, Camera global, int use_global, int radius,
                               int refine, float lambda, float lambdaflat, float texref, int halfpel, Gain gain,
-                              float2* __restrict__ outv,
+                              SearchOpts opt, float2* __restrict__ outv,
                               float* __restrict__ outsad) {
     constexpr int NP = BS * BS / 32;
     const int lane = threadIdx.x;
@@ -313,6 +356,7 @@ __global__ void motion_search(const float* __restrict__ cur, const float* __rest
         dev = warp_sum(dev) * inv_n;
         lam = lambda + (lambdaflat - lambda) * texref / (texref + dev);
     }
+    if (opt.plevel != 1.f) lam *= powf(opt.plevel, (float)opt.level);
 
     auto sad_int = [&](int vx, int vy) {
         float s = 0.f;
@@ -334,6 +378,50 @@ __global__ void motion_search(const float* __restrict__ cur, const float* __rest
         return warp_sum(s) * inv_n;
     };
 
+    // SATD: the difference block, 4x4 Hadamard-transformed, summed. Each warp
+    // stages its differences in shared memory; lanes transform the 4x4 groups.
+    __shared__ float stage[4][BS * BS];
+    float* sh = stage[threadIdx.y];
+    auto satd_of = [&](auto diff) {
+#pragma unroll
+        for (int k = 0; k < NP; k++) sh[lane + 32 * k] = in[k] ? diff(k) : 0.f;
+        __syncwarp();
+        constexpr int G = BS / 4, NS = G * G;
+        float total = 0.f;
+        for (int g = lane; g < NS; g += 32) {
+            const int gx = (g % G) * 4, gy = (g / G) * 4;
+            float m[16];
+#pragma unroll
+            for (int i = 0; i < 16; i++) m[i] = sh[(gy + i / 4) * BS + gx + i % 4];
+#pragma unroll
+            for (int i = 0; i < 4; i++) {  // rows
+                float a = m[i * 4] + m[i * 4 + 1], b = m[i * 4] - m[i * 4 + 1];
+                float c2 = m[i * 4 + 2] + m[i * 4 + 3], d2 = m[i * 4 + 2] - m[i * 4 + 3];
+                m[i * 4] = a + c2; m[i * 4 + 1] = b + d2; m[i * 4 + 2] = a - c2; m[i * 4 + 3] = b - d2;
+            }
+#pragma unroll
+            for (int j = 0; j < 4; j++) {  // columns
+                float a = m[j] + m[4 + j], b = m[j] - m[4 + j];
+                float c2 = m[8 + j] + m[12 + j], d2 = m[8 + j] - m[12 + j];
+                total += fabsf(a + c2) + fabsf(b + d2) + fabsf(a - c2) + fabsf(b - d2);
+            }
+        }
+        __syncwarp();
+        return warp_sum(total) * 0.5f * inv_n;
+    };
+    // Costs used to rank candidates; the reported match error stays SAD
+    auto cost_int = [&](int vx, int vy) {
+        if (!opt.satd) return sad_int(vx, vy);
+        return satd_of([&](int k) {
+            int rx = min(max(px[k] + vx, ar.x0), ar.x1 - 1), ry = min(max(py[k] + vy, ar.y0), ar.y1 - 1);
+            return c[k] - ref[ry * pitch + rx];
+        });
+    };
+    auto cost_frac = [&](float vx, float vy) {
+        if (!opt.satd) return sad_frac(vx, vy);
+        return satd_of([&](int k) { return c[k] - bilinear(ref, pitch, ar, px[k] + vx, py[k] + vy); });
+    };
+
     float2 pred = make_float2(0.f, 0.f);
     int qx = 0, qy = 0;
     if (parent) {
@@ -351,12 +439,19 @@ __global__ void motion_search(const float* __restrict__ cur, const float* __rest
     }
     auto penalty = [&](float vx, float vy) { return lam * (fabsf(vx - pred.x) + fabsf(vy - pred.y)); };
 
+    // lsad: a predictor that matches badly pulls less
+    if (opt.lsad > 0.f && (parent || prior)) {
+        const float sp = sad_int((int)lrintf(pred.x), (int)lrintf(pred.y));
+        if (sp > opt.lsad) lam *= (opt.lsad / sp) * (opt.lsad / sp);
+    }
+    const float new_scale = 1.f + opt.pnew / 256.f;
+
     int best_x = 0, best_y = 0;
-    float best_sad = sad_int(0, 0);
-    float best_cost = best_sad + penalty(0.f, 0.f);
-    auto try_int = [&](int vx, int vy) {
-        float s = sad_int(vx, vy);
-        float cost = s + penalty((float)vx, (float)vy);
+    float best_sad = cost_int(0, 0);
+    float best_cost = best_sad * (1.f + opt.pzero / 256.f) + penalty(0.f, 0.f);
+    auto try_vec = [&](int vx, int vy, float scale) {
+        float s = cost_int(vx, vy);
+        float cost = s * scale + penalty((float)vx, (float)vy);
         if (cost < best_cost) {
             best_cost = cost;
             best_sad = s;
@@ -364,7 +459,10 @@ __global__ void motion_search(const float* __restrict__ cur, const float* __rest
             best_y = vy;
         }
     };
+    auto try_int = [&](int vx, int vy) { try_vec(vx, vy, 1.f); };
 
+    // Predicted vectors: parent and its neighbours, camera motion, previous pair
+    int px_[8], py_[8], np = 0;
     int r = radius;
     if (parent) {
         const int ox[5] = {0, -1, 1, 0, 0}, oy[5] = {0, 0, 0, -1, 1};
@@ -372,19 +470,48 @@ __global__ void motion_search(const float* __restrict__ cur, const float* __rest
         for (int k = 0; k < 5; k++) {
             int nx = min(max(qx + ox[k], 0), pnbx - 1), ny = min(max(qy + oy[k], 0), pnby - 1);
             float2 v = parent[ny * pnbx + nx];
-            try_int((int)lrintf(pscale * v.x), (int)lrintf(pscale * v.y));
+            px_[np] = (int)lrintf(pscale * v.x);
+            py_[np++] = (int)lrintf(pscale * v.y);
         }
         r = refine;
     }
-    if (use_global) try_int((int)lrintf(global.x), (int)lrintf(global.y));
+    if (use_global) {
+        float2 g = camera_at(global, x0 + BS * 0.5f, y0 + BS * 0.5f);
+        px_[np] = (int)lrintf(g.x);
+        py_[np++] = (int)lrintf(g.y);
+    }
     if (prior) {
         float2 v = prior[bi];
-        try_int((int)lrintf(v.x), (int)lrintf(v.y));
+        px_[np] = (int)lrintf(v.x);
+        py_[np++] = (int)lrintf(v.y);
     }
-    const int cx = best_x, cy = best_y;
-    for (int dy = -r; dy <= r; dy++)
-        for (int dx = -r; dx <= r; dx++)
-            if (dx || dy) try_int(cx + dx, cy + dy);
+    for (int k = 0; k < np; k++) try_int(px_[k], py_[k]);
+
+    // Local search around the best predictor, or (trymany) around each one
+    const int centres = opt.trymany ? np + 1 : 1;
+    int cxs[9], cys[9];
+    cxs[0] = best_x;
+    cys[0] = best_y;
+    for (int k = 0; k < np && centres > 1; k++) {
+        cxs[k + 1] = px_[k];
+        cys[k + 1] = py_[k];
+    }
+    for (int c = 0; c < centres; c++)
+        for (int dy = -r; dy <= r; dy++)
+            for (int dx = -r; dx <= r; dx++)
+                if (dx || dy) try_vec(cxs[c] + dx, cys[c] + dy, new_scale);
+
+    // coarse.bad: blocks at the coarsest level that still match badly look further out
+    if (!parent && opt.badrange > radius && best_sad > opt.badsad) {
+        const int br = opt.badrange;
+        for (int dy = -br; dy <= br; dy += 2)
+            for (int dx = -br; dx <= br; dx += 2)
+                if (abs(dx) > radius || abs(dy) > radius) try_vec(dx, dy, new_scale);
+        const int bx2 = best_x, by2 = best_y;
+        for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++)
+                if (dx || dy) try_vec(bx2 + dx, by2 + dy, new_scale);
+    }
 
     float fx = (float)best_x, fy = (float)best_y;
     if (halfpel) {
@@ -394,7 +521,7 @@ __global__ void motion_search(const float* __restrict__ cur, const float* __rest
 #pragma unroll
         for (int k = 0; k < 8; k++) {
             float vx = bxi + hx[k], vy = byi + hy[k];
-            float s = sad_frac(vx, vy);
+            float s = cost_frac(vx, vy);
             float cost = s + penalty(vx, vy);
             if (cost < best_cost) {
                 best_cost = cost;
@@ -408,6 +535,11 @@ __global__ void motion_search(const float* __restrict__ cur, const float* __rest
     if (lane == 0) {
         outv[bi] = make_float2(fx, fy);
         if (outsad) outsad[bi] = best_sad;
+    }
+    if (opt.satd && outsad) {
+        // Occlusion and scene tests expect SAD
+        float plain = sad_frac(fx, fy);
+        if (lane == 0) outsad[bi] = plain;
     }
 }
 
@@ -820,6 +952,7 @@ public:
         }
         const int gside = 2 * kGlobalRadius + 1;
         CK(cudaMalloc(&gcost_, sizeof(float) * gside * gside));
+        CK(cudaHostAlloc(&host_fit_, sizeof(float2) * kFitMax, cudaHostAllocDefault));
         CK(cudaHostAlloc(&host_gcost_, sizeof(float) * gside * gside, cudaHostAllocDefault));
         CK(cudaMalloc(&tmpv_, sizeof(float2) * nb0));
         CK(cudaMalloc(&stats_, 3 * sizeof(float)));
@@ -857,6 +990,7 @@ public:
                 cudaFree(q.nvsad[d]);
             }
         cudaFree(gcost_);
+        cudaFreeHost(host_fit_);
         cudaFreeHost(host_gcost_);
         free_nvof();
         cudaFree(tmpv_);
@@ -1173,25 +1307,29 @@ private:
         const dim3 blk(32, 4);
         const Gain gain = d ? inverse(q.gain) : q.gain;  // cur's brightness onto ref's
         const int top = levels_ - 1;
-        // Camera motion at the coarsest level, before any block search
-        const float2 global = p_.gmv && top > 0 ? camera_motion(cur, ref, level_area(q.area, top, lw_[top], lh_[top]),
-                                                                gain)
-                                                : make_float2(0.f, 0.f);
+        // Camera motion, full-resolution units: the best whole-frame shift at the
+        // coarsest level to start, refined with zoom and rotation as levels finish
+        CameraModel cam;
+        if (p_.gmv && top > 0) {
+            const float2 shift = camera_motion(cur, ref, level_area(q.area, top, lw_[top], lh_[top]), gain);
+            cam.tx = shift.x * (1 << top);
+            cam.ty = shift.y * (1 << top);
+        }
         for (int l = top; l >= 0; l--) {
             const int nb = nbx_[l] * nby_[l];
             const dim3 grid((nb + blk.y - 1) / blk.y);
             const float2* parent = l == top ? nullptr : q.v[d][l + 1];
             const int pnbx = l == top ? 0 : nbx_[l + 1], pnby = l == top ? 0 : nby_[l + 1];
             const float2* prior = p_.temporal && prev ? prev->v[d][l] : nullptr;
-            const float gs = (float)(1 << (top - l));
-            const float2 g = make_float2(global.x * gs, global.y * gs);
+            const Camera g = cam.at(l, pw_[0], ph_[0]);
             float2* out = (l == 0 && p_.smooth) ? tmpv_ : q.v[d][l];
             float* lsad = l == 0 ? q.sad0[d] : nullptr;
             const int halfpel = l == 0 && p_.pel > 1;
             launch(p_.blksize, grid, blk, cur.pyr[l], ref.pyr[l], lw_[l], level_area(q.area, l, lw_[l], lh_[l]),
                    nbx_[l], nby_[l], parent, nullptr,
                    pnbx, pnby, 2.f, 0.f, prior, g, p_.gmv && top > 0, p_.radius, p_.refine, halfpel, gain, out,
-                   lsad);
+                   lsad, l);
+            if (p_.gmv && p_.zoom && l > 0) fit_camera(q.v[d][l], l, level_area(q.area, l, lw_[l], lh_[l]), cam);
         }
         if (p_.smooth) {
             const dim3 mblk(16, 16);
@@ -1199,7 +1337,7 @@ private:
             CK(cudaGetLastError());
         }
         // Block splitting: blocks that still match badly are searched again as four halves
-        const float2 g0 = make_float2(global.x * (1 << top), global.y * (1 << top));
+        const Camera g0 = cam.at(0, pw_[0], ph_[0]);
         const float gate = p_.thsad / 64.f;  // thsad is an 8x8 block SAD; the sad maps hold per-pixel means
         for (int k = 0; k < splits_; k++) {
             const int nb = snbx_[k] * snby_[k];
@@ -1215,13 +1353,13 @@ private:
 
     void launch(int bs, dim3 grid, dim3 blk, const float* cur, const float* ref, int pitch, Area ar, int nbx, int nby,
                 const float2* parent, const float* psad, int pnbx, int pnby, float pscale, float gate,
-                const float2* prior, float2 global, int use_global, int radius, int refine, int halfpel,
-                Gain gain, float2* out, float* sad) {
+                const float2* prior, Camera global, int use_global, int radius, int refine, int halfpel,
+                Gain gain, float2* out, float* sad, int level = 0) {
 #define LAUNCH(BS)                                                                                            \
     motion_search<BS><<<grid, blk, 0, stream_>>>(cur, ref, ar, pitch, nbx, nby, parent, psad, pnbx, pnby, pscale, \
                                                  gate, prior, global, use_global, radius, refine, p_.lambda,   \
                                                  p_.lambdaflat, p_.texref,                                     \
-                                                 halfpel, gain, out, sad)
+                                                 halfpel, gain, opts(level), out, sad)
         if (bs == 8)
             LAUNCH(8);
         else if (bs == 16)
@@ -1230,6 +1368,83 @@ private:
             LAUNCH(32);
 #undef LAUNCH
         CK(cudaGetLastError());
+    }
+
+    SearchOpts opts(int level) const {
+        return {p_.lsad / 64.f, p_.plevel, p_.pnew, p_.pzero, p_.badsad / 64.f, p_.badrange, p_.trymany, p_.satd,
+                level};
+    }
+
+    // Camera motion in full-resolution pixels: v(p) = t + s*(p - c) + r*perp(p - c)
+    struct CameraModel {
+        double tx = 0, ty = 0, s = 0, r = 0;
+        Camera at(int l, int w, int h) const {
+            const float k = 1.f / (1 << l);
+            return {(float)tx * k, (float)ty * k, (float)s, (float)r, w * 0.5f * k, h * 0.5f * k};
+        }
+    };
+
+    // Least-squares fit of shift, zoom and rotation to level l's block vectors,
+    // twice: the second time without blocks far from the first fit (moving
+    // objects). Kept only when most blocks agree with it.
+    void fit_camera(const float2* v, int l, const Area& ar, CameraModel& cam) {
+        const int nbx = nbx_[l], nby = nby_[l], nb = nbx * nby, bs = p_.blksize;
+        if (nb < 24 || nb > kFitMax) return;
+        CK(cudaMemcpyAsync(host_fit_, v, sizeof(float2) * nb, cudaMemcpyDeviceToHost, stream_));
+        CK(cudaStreamSynchronize(stream_));
+        const double cx = pw_[0] * 0.5 / (1 << l), cy = ph_[0] * 0.5 / (1 << l);
+        std::vector<int> use;
+        for (int i = 0; i < nb; i++) {
+            const int x = (i % nbx) * bs + bs / 2, y = (i / nbx) * bs + bs / 2;
+            if (x >= ar.x0 && x < ar.x1 && y >= ar.y0 && y < ar.y1) use.push_back(i);
+        }
+        if (use.size() < 24) return;
+        double tx = 0, ty = 0, sc = 0, rot = 0;
+        std::vector<double> err(nb);
+        for (int pass = 0; pass < 2; pass++) {
+            // Normal equations for (tx, ty, s, r); with dx, dy around the centre
+            double n = 0, sdx = 0, sdy = 0, sd2 = 0, svx = 0, svy = 0, sxv = 0, scr = 0;
+            for (int i : use) {
+                const double dx = (i % nbx) * bs + bs / 2 - cx, dy = (i / nbx) * bs + bs / 2 - cy;
+                const double vx = host_fit_[i].x, vy = host_fit_[i].y;
+                n += 1; sdx += dx; sdy += dy; sd2 += dx * dx + dy * dy;
+                svx += vx; svy += vy; sxv += dx * vx + dy * vy; scr += dx * vy - dy * vx;
+            }
+            // tx, ty, s, r from the 4x4 system (it separates once the sums are centred)
+            const double mdx = sdx / n, mdy = sdy / n;
+            const double var = sd2 / n - mdx * mdx - mdy * mdy;
+            if (var < 1.0) return;
+            const double mvx = svx / n, mvy = svy / n;
+            sc = (sxv / n - (mdx * mvx + mdy * mvy)) / var;
+            rot = (scr / n - (mdx * mvy - mdy * mvx)) / var;
+            tx = mvx - sc * mdx + rot * mdy;
+            ty = mvy - sc * mdy - rot * mdx;
+            // Residuals; keep the blocks that agree (moving objects drop out)
+            std::vector<double> sorted;
+            for (int i : use) {
+                const double dx = (i % nbx) * bs + bs / 2 - cx, dy = (i / nbx) * bs + bs / 2 - cy;
+                const double ex = host_fit_[i].x - (tx + sc * dx - rot * dy);
+                const double ey = host_fit_[i].y - (ty + sc * dy + rot * dx);
+                err[i] = std::sqrt(ex * ex + ey * ey);
+                sorted.push_back(err[i]);
+            }
+            std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
+            const double limit = std::max(1.0, 2.5 * sorted[sorted.size() / 2]);
+            const size_t before = use.size();
+            std::vector<int> keep;
+            for (int i : use)
+                if (err[i] <= limit) keep.push_back(i);
+            if (keep.size() * 10 < before * 6) return;  // no motion most of the frame shares
+            use.swap(keep);
+        }
+        // Zoom or rotation too small to move the frame's edge half a pixel: a pan
+        const double reach = std::max(cx, cy);
+        if (std::fabs(sc) * reach < 0.5) sc = 0;
+        if (std::fabs(rot) * reach < 0.5) rot = 0;
+        cam.tx = tx * (1 << l);
+        cam.ty = ty * (1 << l);
+        cam.s = sc;
+        cam.r = rot;
     }
 
     // Camera motion estimate: the best whole-frame shift at the coarsest level,
@@ -1429,6 +1644,7 @@ private:
     NvOFHandle of_h_[2] = {};
     NvOFGPUBufferHandle of_in_[2][2] = {}, of_out_[2] = {};
     uint32_t of_in_pitch_ = 0, of_out_pitch_ = 0;
+    float2* host_fit_ = nullptr;   // a coarse level's vectors, for the camera motion fit
     float* gcost_ = nullptr;       // camera motion search costs, device and pinned host
     float* host_gcost_ = nullptr;
     Area stable_ = {}, candidate_ = {};  // letterbox bars in use, and the ones waiting to be confirmed
@@ -1577,6 +1793,15 @@ static void VS_CC interp_create(const VSMap* in, VSMap* out, void*, VSCore* core
     p.thsad = geti("thsad", p.thsad);
     p.gmv = geti("gmv", p.gmv);
     p.temporal = geti("temporal", p.temporal);
+    p.zoom = geti("zoom", p.zoom);
+    p.lsad = geti("lsad", p.lsad);
+    p.plevel = getf("plevel", p.plevel);
+    p.pnew = getf("pnew", p.pnew);
+    p.pzero = getf("pzero", p.pzero);
+    p.badsad = geti("badsad", p.badsad);
+    p.badrange = geti("badrange", p.badrange);
+    p.trymany = geti("trymany", p.trymany);
+    p.satd = geti("satd", p.satd);
     p.blend = geti("blend", p.blend);
     p.thscd1 = geti("thscd1", p.thscd1);
     p.thscd2 = geti("thscd2", p.thscd2);
@@ -1628,11 +1853,11 @@ static void VS_CC interp_create(const VSMap* in, VSMap* out, void*, VSCore* core
 }
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI* vspapi) {
-    vspapi->configPlugin("com.mpv-portable.gpumv", "gpumv", "GPU motion-compensated frame interpolation",
-                         VS_MAKE_VERSION(0, 11), VAPOURSYNTH_API_VERSION, 0, plugin);
+    vspapi->configPlugin(GPUMV_ID, GPUMV_NS, "GPU motion-compensated frame interpolation",
+                         VS_MAKE_VERSION(0, 13), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction("Interpolate",
                              "clip:vnode;num:int;den:int:opt;mode:int:opt;blksize:int:opt;pel:int:opt;radius:int:opt;"
-                             "refine:int:opt;lambda:float:opt;lambdaflat:float:opt;texref:float:opt;smooth:int:opt;split:int:opt;thsad:int:opt;gmv:int:opt;temporal:int:opt;blend:int:opt;thscd1:int:opt;"
+                             "refine:int:opt;lambda:float:opt;lambdaflat:float:opt;texref:float:opt;smooth:int:opt;split:int:opt;thsad:int:opt;gmv:int:opt;temporal:int:opt;zoom:int:opt;lsad:int:opt;plevel:float:opt;pnew:float:opt;pzero:float:opt;badsad:int:opt;badrange:int:opt;trymany:int:opt;satd:int:opt;blend:int:opt;thscd1:int:opt;"
                              "thscd2:int:opt;scratio:float:opt;ml:float:opt;mask:float:opt;occsad:float:opt;bars:int:opt;barsth:float:opt;static:float:opt;fades:int:opt;prefilter:int:opt;nvof:int:opt;dedup:int:opt;holdmax:int:opt;strength:float:opt;dupth:float:opt;device:int:opt;",
                              "clip:vnode;", interp_create, nullptr, plugin);
 }

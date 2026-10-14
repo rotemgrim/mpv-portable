@@ -12,11 +12,20 @@ set "PATH=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer;%PATH%"
 call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
 
 if not exist build mkdir build
+rem "build.cmd dev": a copy named gpumvdev in build\, not installed, for testing
+rem while mpv has the installed plugin open (tests: set GPUMV_DEV=<path>)
+set "OUT=build\gpumv.dll"
+set "DEFS="
+if /i "%~1"=="dev" (
+    set "OUT=build\gpumv_dev.dll"
+    set "DEFS=-DGPUMV_NS=\"gpumvdev\" -DGPUMV_ID=\"com.mpv-portable.gpumvdev\""
+)
 rem sm_120 native code for RTX 50, PTX for older GPUs (JIT-compiled by the driver)
-nvcc -O3 -std=c++17 -shared -o build\gpumv.dll src\gpumv.cu -Iinclude -lcuda ^
+nvcc -O3 -std=c++17 -shared -o %OUT% src\gpumv.cu -Iinclude -lcuda %DEFS% ^
     -Xcompiler "/MD /O2 /W3" ^
     -gencode arch=compute_75,code=compute_75 ^
     -gencode arch=compute_120,code=sm_120 || exit /b 1
 
+if /i "%~1"=="dev" (echo Built %OUT% & exit /b 0)
 copy /y build\gpumv.dll ..\bin\Lib\site-packages\vapoursynth\plugins\gpumv.dll >nul || (echo Install failed, is mpv running? & exit /b 1)
 echo Installed gpumv.dll

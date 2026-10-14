@@ -8,20 +8,14 @@ Ordered by impact on everyday movie watching, most impactful first.
 2. [ ] **Detect animation automatically** and switch to the anime settings, instead of Ctrl+9. Held frames alone aren't enough (one of the two anime test scenes has none)
 6. [ ] **Lip-sync check with real speakers** and a **4K playback check** on a normally running display (tests so far used simulated audio, and the display was misreporting its refresh rate)
 10. [ ] **Hybrid with RIFE**: AI frames combined with motion vectors, like SVP's `SmoothFps_RIFE`
-11. [ ] **Zoom estimation**: camera motion currently covers pans only
-12. [ ] **Motion search options from SVP / MVTools** not implemented yet:
-    - [ ] `coarse.bad`: wider re-search at the coarse level for blocks that still match badly
-    - [ ] `lsad`: weaken the coherence penalty where the match error is high
-    - [ ] `plevel`: lambda scaling per pyramid level
-    - [ ] `pnew`: penalty for vectors that differ from all predictors
-    - [ ] `trymany`: try several starting predictors fully instead of picking one first
-    - [ ] `satd`: Hadamard-transform matching cost instead of SAD
 14. [ ] **Parallel processing**: several CUDA streams, overlapping uploads, compute and downloads. Speed is already 2.5x real time at 4K/120
 15. [ ] **Overlapped blocks** for smoother block-mode (`mode=0`) output; the default adaptive mode doesn't need it
 16. [ ] **Vendor-neutral backend** (Vulkan compute) for AMD and Intel GPUs
 
 ## Done
 
+- [x] **Motion search options** (`lsad`, `plevel`, `pnew`, `pzero`, `badsad`/`badrange`, `trymany`, `satd`): all implemented; Ctrl+9 uses `pnew=100` and `satd=1` (anime-1 34.67 -> 35.16, anime-2 33.77 -> 33.94, hardest frames 30.04 -> 30.65, no speed cost); the others showed no gain
+- [x] **Zoom estimation** (`zoom`): shift + zoom + rotation fitted to each coarse level; zooms up to 2%/frame were already 54-56 dB without it, crash zooms (4-10%/frame) gain +0.1 to +0.6 dB; neutral elsewhere, ~6% slower in the block search
 - [x] **NVIDIA optical-flow hardware** (`nvof`): RTX 5080 has it (`test/nvof_probe.cmd`: 1080p 0.8-1.8 ms, 4K 2-6 ms per pair). As gpumv's motion source it beats the block search on all 8 live-action film scenes (+0.17 dB average at the medium level) and is faster at 4K; Ctrl+8 uses it, Ctrl+9 keeps the block search
 - [x] **mpv crash on exit**: not gpumv or any plugin; a do-nothing VapourSynth script with no plugins loaded crashes the same way at shutdown (mpv/VapourSynth/embedded Python). Documented, harmless
 - [x] **Fast action and motion blur**: tested (`pans.py blur=1`), no change needed: blurred pans stay clean (116 dB at 80 px/pair, 40 dB at 200), masking strength makes no difference; blurred action in the film set already beats MVTools

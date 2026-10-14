@@ -38,7 +38,8 @@ build.cmd
 ```
 
 This builds `build\gpumv.dll` and copies it into `bin\Lib\site-packages\vapoursynth\plugins`.
-Close mpv first, or the copy fails. The CUDA runtime is linked in, so other PCs only need an NVIDIA
+Close mpv first, or the copy fails. `build.cmd dev` builds a copy named `gpumvdev` into `build\`
+without installing it; tests load it when `GPUMV_DEV` points at it. The CUDA runtime is linked in, so other PCs only need an NVIDIA
 driver. To ship it, rebuild the release payload with `tools\build-payload.ps1`, which packs the
 whole plugins folder.
 
@@ -48,7 +49,9 @@ whole plugins folder.
 gpumv.Interpolate(clip clip, int num[, int den=1, int mode=2, int blksize=16, int pel=1,
                   int radius=4, int refine=2, float lambda=0.1, float lambdaflat=0, float texref=4,
                   int smooth=1, int split=0,
-                  int thsad=250, int gmv=1, int temporal=1, int blend=0, int thscd1=400,
+                  int thsad=250, int gmv=1, int zoom=1, int temporal=1, int lsad=0, float plevel=1,
+                  float pnew=0, float pzero=0, int badsad=0, int badrange=0, int trymany=0, int satd=0,
+                  int blend=0, int thscd1=400,
                   int thscd2=130, float scratio=3, float ml=100, float mask=0.5, float occsad=2,
                   int bars=1, float barsth=24, float static=0, int fades=1, int prefilter=0,
                   int dedup=1, int holdmax=3, float dupth=0.4, float strength=1, int nvof=0,
@@ -68,7 +71,18 @@ gpumv.Interpolate(clip clip, int num[, int den=1, int mode=2, int blksize=16, in
   and searched again, like SVP's `refine`. Off: no gain measured
 - `gmv`: camera motion. The best whole-frame shift at the coarsest level, up to a quarter of the
   frame width either way, seeds every level of the block search
+- `zoom`: after each coarse level, fit shift + zoom + rotation to its vectors (least squares, then
+  again without the blocks that disagree, such as moving objects) and give every block the camera's
+  motion at its own position as a candidate. Small gain: +0.1 to +0.6 dB on crash zooms (4-10%
+  per frame), none on normal footage; the block search follows slower zooms on its own
 - `temporal`: try the vector the block had in the previous frame pair
+- `lsad`, `plevel`, `pnew`, `pzero`, `badsad`/`badrange`, `trymany`, `satd`: finer search options
+  after MVTools' of the same names. `lsad`: a predictor matching worse than this (8x8-block SAD)
+  pulls less; `plevel`: coherence times plevel^level; `pnew`/`pzero`: extra relative cost (/256)
+  for searched vectors / the zero vector; `badsad`/`badrange`: coarsest-level blocks still worse
+  than badsad search out to badrange; `trymany`: refine around every predictor; `satd`: rank
+  candidates by 4x4 Hadamard-transformed difference. Ctrl+9 uses `pnew=100 satd=1` (anime +0.3 dB);
+  the rest showed no gain and stay off
 - `thscd1`, `thscd2`, `ml`: as in MVTools
 - `blend`: at a scene change, 1 cross-fades, 0 shows the nearest real frame
 - `scratio`: a pair whose match error is this many times its neighbours' is a scene change, which
@@ -121,7 +135,7 @@ OpenCL). gpumv runs the same three stages in one CUDA filter.
 | `refine` (`thsad`) | `split`, `thsad` |
 | scene `limits` incl. `luma` | `thscd1`/`thscd2`, `scratio`; fades compensated instead of cut |
 | black bar detection and crop | `bars` |
-| `coarse.bad`, `trymany`, `plevel`, `lsad`, `pnew`, `satd` | not implemented |
+| `coarse.bad`, `trymany`, `plevel`, `lsad`, `pnew`, `pzero`, `satd` | same names (`badsad`/`badrange` for `coarse.bad`) |
 
 Beyond what SVP documents: held-frame spreading (an open feature request on SVP's forum) and fade
 compensation. SVP also has `SmoothFps_NVOF` (NVIDIA optical-flow vectors) and `SmoothFps_RIFE`.
@@ -144,6 +158,7 @@ rebuild it and score luma PSNR against the frames that were dropped.
 - `test\pans.py <clip.yuv> <w> <h>`: synthetic camera pans at four speeds
 - `test\held.py <clip.yuv> <w> <h>`: animation on twos and threes, and a still shot
 - `test\credits.py`: rolling credits at four scroll speeds
+- `test\zooms.py <clip.yuv> <w> <h> [rates=...]`: synthetic camera zooms in and out
 - `test\crops.py <clip.yuv> <w> <h> <out.png> [methods] [pick=disagree]`: PNG grid of the hardest frame
 - `test\bench.py <script.vpy> <w> <h> [frames] [inflight]`: throughput (`BENCH_DISPLAY_FPS` sets the
   display rate the script sees)
