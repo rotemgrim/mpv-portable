@@ -6,13 +6,7 @@ Ordered by impact on everyday movie watching, most impactful first.
 
 1. [ ] **Publish the release payload** with `gpumv.dll`: run `tools\build-payload.ps1` (uploads to the `payload` release). CI already excludes the `gpumv/` source folder from the package
 2. [ ] **Detect animation automatically** and switch to the anime settings, instead of Ctrl+9. Held frames alone aren't enough (one of the two anime test scenes has none)
-3. [ ] **Interpolation strength / film look**: setting that keeps some of the original cadence, for people who dislike the soap-opera effect
-4. [ ] **Fast action and motion blur**: fall back to blending where blur makes matching unreliable (very fast pans now work up to a quarter of the frame width per frame pair)
-5. [ ] **NVIDIA optical-flow hardware**: confirm the RTX 5080 has it (probe program with NVIDIA's public SDK headers), then try it for motion vectors like SVP's `SmoothFps_NVOF`
 6. [ ] **Lip-sync check with real speakers** and a **4K playback check** on a normally running display (tests so far used simulated audio, and the display was misreporting its refresh rate)
-7. [ ] **Telecine / interlaced sources**: document or automate inverse telecine (`vf=ivtc`) before interpolation
-8. [ ] **Particles, water, fire, rain**: detect areas with high motion variance and blend them
-9. [ ] **Rolling credits and scrolling text**: check with the camera-motion search and adaptive mode
 10. [ ] **Hybrid with RIFE**: AI frames combined with motion vectors, like SVP's `SmoothFps_RIFE`
 11. [ ] **Zoom estimation**: camera motion currently covers pans only
 12. [ ] **Motion search options from SVP / MVTools** not implemented yet:
@@ -22,13 +16,19 @@ Ordered by impact on everyday movie watching, most impactful first.
     - [ ] `pnew`: penalty for vectors that differ from all predictors
     - [ ] `trymany`: try several starting predictors fully instead of picking one first
     - [ ] `satd`: Hadamard-transform matching cost instead of SAD
-13. [ ] **mpv crash on exit** after any VapourSynth filter (also with MVTools and RIFE); harmless during playback
 14. [ ] **Parallel processing**: several CUDA streams, overlapping uploads, compute and downloads. Speed is already 2.5x real time at 4K/120
 15. [ ] **Overlapped blocks** for smoother block-mode (`mode=0`) output; the default adaptive mode doesn't need it
 16. [ ] **Vendor-neutral backend** (Vulkan compute) for AMD and Intel GPUs
 
 ## Done
 
+- [x] **NVIDIA optical-flow hardware** (`nvof`): RTX 5080 has it (`test/nvof_probe.cmd`: 1080p 0.8-1.8 ms, 4K 2-6 ms per pair). As gpumv's motion source it beats the block search on all 8 live-action film scenes (+0.17 dB average at the medium level) and is faster at 4K; Ctrl+8 uses it, Ctrl+9 keeps the block search
+- [x] **mpv crash on exit**: not gpumv or any plugin; a do-nothing VapourSynth script with no plugins loaded crashes the same way at shutdown (mpv/VapourSynth/embedded Python). Documented, harmless
+- [x] **Fast action and motion blur**: tested (`pans.py blur=1`), no change needed: blurred pans stay clean (116 dB at 80 px/pair, 40 dB at 200), masking strength makes no difference; blurred action in the film set already beats MVTools
+- [x] **Rolling credits**: tested (`credits.py`): 68-111 dB at 2-16 px/frame, against 17-24 dB for blending
+- [x] **Particles, water, fire, rain**: covered by artifact masking; revisit with a failing example
+- [x] **Telecine / interlaced sources**: documented as a limit (README); not automated, since deinterlacing can double the frame rate behind gpumv's back
+- [x] **Film look** (`strength`, Look: Smooth / Natural in the window): real frames held for part of each gap; from 24 fps, Natural builds 40% of the frames instead of 80%
 - [x] **Settings window** (Ctrl+G, `smoothing-settings.ps1`): WPF window talking to mpv over its IPC pipe; replaces the old Ctrl+M text menu
 - [x] **Per-block coherence by texture** (`lambdaflat`), to replace the two modes: tried, off. It hurts live action (blur and soft backgrounds look flat) before it helps anime enough
 - [x] **Anime quality**: Ctrl+9 preset (32 px blocks, lambda 2.0, mask 1.0) beats MVTools on the anime scenes (34.23 vs 34.15 dB, worst frames 30.04 vs 28.03 on one); live action keeps Ctrl+8, where these settings would cost up to 3.4 dB

@@ -6,7 +6,11 @@ rebuilds 30 -> 60 with gpumv. Because the motion is a pure pan the real frames
 are known exactly. Fast pans move further per frame pair than the block search
 reaches on its own, which is where a global (camera) motion estimate matters.
 
-    python.exe pans.py <clip.yuv> <width> <height> [key=value ...]
+    python.exe pans.py <clip.yuv> <width> <height> [blur=1] [variants=a;b] [key=value ...]
+
+blur=1 adds camera motion blur (each frame averages 8 positions across half the
+frame time, like a 180-degree shutter). variants=gmv=1;gmv=0 sets the columns
+(semicolon-separated, each a comma-separated list of key=value).
 """
 import ctypes
 import math
@@ -17,10 +21,18 @@ import vapoursynth as vs
 
 core = vs.core
 path, w, h = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
-params = {}
-for a in sys.argv[4:]:
-    k, v = a.split("=", 1)
-    params["lambda_" if k == "lambda" else k] = float(v) if "." in v else int(v)
+def parse(items):
+    out = {}
+    for a in items:
+        k, v = a.split("=", 1)
+        out["lambda_" if k == "lambda" else k] = float(v) if "." in v else int(v)
+    return out
+
+
+raw = dict(a.split("=", 1) for a in sys.argv[4:])
+blur = raw.pop("blur", "0") == "1"
+variant_spec = raw.pop("variants", "gmv=1;gmv=0")
+params = parse(f"{k}={v}" for k, v in raw.items())
 
 fs = w * h * 3 // 2
 fh = open(path, "rb")
@@ -47,8 +59,16 @@ ow, oh = 1920, 800
 
 def pan(speed, frames=120):
     span = still.width - ow
+    if blur:
+        subs = [pan_at(speed, frames, k / 16) for k in range(8)]
+        return core.std.AverageFrames(subs, weights=[1] * 8)
+    return pan_at(speed, frames, 0.0)
+
+
+def pan_at(speed, frames, offset):
+    span = still.width - ow
     def window(n, c=still):
-        x = int(n * speed) % (2 * span)
+        x = int((n + offset) * speed) % (2 * span)
         x = x if x <= span else 2 * span - x  # bounce at the edges
         y = (still.height - oh) // 2
         return c.std.Crop(left=x // 2 * 2, top=y // 2 * 2, right=still.width - ow - x // 2 * 2,
@@ -76,7 +96,7 @@ def score(speed, extra):
     return res
 
 
-variants = [("gmv=1", {"gmv": 1}), ("gmv=0", {"gmv": 0})]
+variants = [(v, parse(v.split(","))) for v in variant_spec.split(";")]
 print(f"{'pan speed':<22}" + "".join(f"{label + ' whole / centre':>26}" for label, _ in variants))
 for speed in (8, 40, 100, 200):
     cells = "".join("{:>14.2f} / {:6.2f} dB".format(*score(speed, extra)) for _, extra in variants)

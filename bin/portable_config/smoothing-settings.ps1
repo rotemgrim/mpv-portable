@@ -170,6 +170,13 @@ function Set-Config([hashtable]$Values) {
       </WrapPanel>
       <TextBlock x:Name="FpsHint" Style="{StaticResource Hint}"/>
 
+      <TextBlock Text="LOOK" Style="{StaticResource Label}"/>
+      <WrapPanel>
+        <RadioButton x:Name="LookSmooth"  GroupName="look" Style="{StaticResource Chip}" Content="Smooth"  Tag="1.0"/>
+        <RadioButton x:Name="LookNatural" GroupName="look" Style="{StaticResource Chip}" Content="Natural" Tag="0.6"/>
+      </WrapPanel>
+      <TextBlock x:Name="LookHint" Style="{StaticResource Hint}"/>
+
       <TextBlock Text="QUALITY" Style="{StaticResource Label}"/>
       <WrapPanel>
         <RadioButton x:Name="QualityBest" GroupName="quality" Style="{StaticResource Chip}" Content="Best" Tag="2"/>
@@ -217,7 +224,8 @@ function Set-Config([hashtable]$Values) {
 $window = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xaml))
 $ui = @{}
 foreach ($name in 'TitleBar', 'CloseButton', 'ModeOff', 'ModeBasic', 'ModeFilm', 'ModeAnime', 'ModeHint',
-                  'FpsAuto', 'FpsAuto2', 'Fps60', 'Fps120', 'FpsHint', 'QualityBest', 'QualityFast', 'QualityHint',
+                  'FpsAuto', 'FpsAuto2', 'Fps60', 'Fps120', 'FpsHint', 'LookSmooth', 'LookNatural', 'LookHint',
+                  'QualityBest', 'QualityFast', 'QualityHint',
                   'SharpCuts', 'HeldFrames', 'Bars', 'Fades', 'StatusDot', 'Status') {
     $ui[$name] = $window.FindName($name)
 }
@@ -227,6 +235,10 @@ $modeHints = @{
     ModeBasic = "mpv's own smoothing: removes judder, no new in-between frames. Lightest."
     ModeFilm  = 'Builds new in-between frames on the GPU. Best for films, TV and games.'
     ModeAnime = 'Same, tuned for cartoons and anime: keeps lines steady in flat colour.'
+}
+$lookHints = @{
+    LookSmooth  = 'Every in-between frame is built: the most fluid motion.'
+    LookNatural = "Real frames stay on screen longer: about half the smoothing, closer to the film's own feel."
 }
 $qualityHints = @{
     QualityBest = 'Cleanest edges around moving objects.'
@@ -253,6 +265,8 @@ function Update-Hints {
     foreach ($m in 'ModeOff', 'ModeBasic', 'ModeFilm', 'ModeAnime') {
         if ($ui[$m].IsChecked) { $ui.ModeHint.Text = $modeHints[$m] }
     }
+    if ($ui.LookSmooth.IsChecked) { $ui.LookHint.Text = $lookHints.LookSmooth }
+    if ($ui.LookNatural.IsChecked) { $ui.LookHint.Text = $lookHints.LookNatural }
     if ($ui.QualityBest.IsChecked) { $ui.QualityHint.Text = $qualityHints.QualityBest }
     if ($ui.QualityFast.IsChecked) { $ui.QualityHint.Text = $qualityHints.QualityFast }
     $screen = Get-MpvProperty 'display-fps'
@@ -274,6 +288,7 @@ function Load-State {
     elseif ($dst -eq '60') { $ui.Fps60.IsChecked = $true }
     elseif ($dst -eq '120') { $ui.Fps120.IsChecked = $true }
     if ($c['gpumv_mode'] -eq '1') { $ui.QualityFast.IsChecked = $true } else { $ui.QualityBest.IsChecked = $true }
+    if ($c['gpumv_strength'] -and [double]$c['gpumv_strength'] -lt 0.99) { $ui.LookNatural.IsChecked = $true } else { $ui.LookSmooth.IsChecked = $true }
     $ui.SharpCuts.IsChecked = $c['gpumv_blend'] -ne '1'
     $ui.HeldFrames.IsChecked = $c['gpumv_dedup'] -ne '0'
     $ui.Bars.IsChecked = $c['gpumv_bars'] -ne '0'
@@ -304,6 +319,9 @@ foreach ($f in 'FpsAuto', 'FpsAuto2', 'Fps60', 'Fps120') {
         $parts = ([string]$sender.Tag).Split('|')
         Save-And-Reload @{ dst_fps = $parts[0]; max_fps = $parts[1] }
     })
+}
+foreach ($l in 'LookSmooth', 'LookNatural') {
+    $ui[$l].Add_Checked({ param($sender) Save-And-Reload @{ gpumv_strength = [string]$sender.Tag } })
 }
 foreach ($q in 'QualityBest', 'QualityFast') {
     $ui[$q].Add_Checked({ param($sender) Save-And-Reload @{ gpumv_mode = [string]$sender.Tag } })

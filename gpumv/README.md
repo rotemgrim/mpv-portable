@@ -51,7 +51,8 @@ gpumv.Interpolate(clip clip, int num[, int den=1, int mode=2, int blksize=16, in
                   int thsad=250, int gmv=1, int temporal=1, int blend=0, int thscd1=400,
                   int thscd2=130, float scratio=3, float ml=100, float mask=0.5, float occsad=2,
                   int bars=1, float barsth=24, float static=0, int fades=1, int prefilter=0,
-                  int dedup=1, int holdmax=3, float dupth=0.4, int device=0])
+                  int dedup=1, int holdmax=3, float dupth=0.4, float strength=1, int nvof=0,
+                  int device=0])
 ```
 
 - `clip`: 8–16 bit integer YUV or Gray with a known frame rate
@@ -80,6 +81,13 @@ gpumv.Interpolate(clip clip, int num[, int den=1, int mode=2, int blksize=16, in
   keeps burned-in subtitles intact
 - `fades`: scale one frame's brightness to the other's (around black) before matching
 - `prefilter`: blur radius (0-2) of the copy used for matching. Off: no gain measured on grainy film
+- `nvof`: motion from NVIDIA's optical-flow hardware (RTX 20 and later) instead of the block search:
+  0 off, 1 fast, 2 medium, 3 slow. One vector per 4x4 pixels in both directions; occlusion, scene,
+  bar and held-frame handling stay the same. Falls back to the block search without the hardware.
+  Ctrl+8 uses 2 (best on the film set, +0.17 dB, and faster at 4K); Ctrl+9 keeps the block search
+- `strength`: film look. 1 builds every in-between frame evenly; lower values keep each real frame
+  on screen for part of the gap and move in the middle of it, keeping some of the original cadence
+  (like SVP's 1m/2m modes). From 24 fps, 0.6 builds 40% of the output frames instead of 80%
 - `dedup`: animation on twos or threes. Runs of up to `holdmax` identical frames (mean difference
   under `dupth`, quarter resolution) count as one drawing, and the motion to the next drawing is
   spread over the whole run. Longer runs are a still shot and stay as they are
@@ -135,6 +143,7 @@ rebuild it and score luma PSNR against the frames that were dropped.
 - `test\fades.py <clip.yuv> <w> <h>`: one-second fade towards black
 - `test\pans.py <clip.yuv> <w> <h>`: synthetic camera pans at four speeds
 - `test\held.py <clip.yuv> <w> <h>`: animation on twos and threes, and a still shot
+- `test\credits.py`: rolling credits at four scroll speeds
 - `test\crops.py <clip.yuv> <w> <h> <out.png> [methods] [pick=disagree]`: PNG grid of the hardest frame
 - `test\bench.py <script.vpy> <w> <h> [frames] [inflight]`: throughput (`BENCH_DISPLAY_FPS` sets the
   display rate the script sees)
@@ -175,4 +184,10 @@ MVTools Ctrl+3 settings 204, MVTools bs16 overlap8 pel2 74.
 - NVIDIA only
 - No overlapped blocks; flow mode interpolates vectors between block centres instead
 - Brightness flashes count as scene changes (no interpolation across them)
+- mpv crashes while exiting after any VapourSynth filter, even a script that only passes the video
+  through with no plugins loaded: an mpv/VapourSynth/embedded-Python shutdown issue, not gpumv. It
+  happens after playback has ended
 - New letterbox bars take 12 frame pairs (about half a second) to be used
+- Interlaced and telecined sources (DVD, old TV) aren't handled: gpumv takes the frame rate from the
+  file, so a deinterlacer that doubles the rate in front of it would make the motion run at the
+  wrong speed. Progressive films and series (Blu-ray, web releases) are unaffected

@@ -26,6 +26,9 @@
 //   6. Scene change: the thscd1/thscd2 block count, or the pair's mean match
 //      error spiking against the neighbouring pairs (catches dark cuts the
 //      fixed thresholds miss). Cuts show the nearest real frame.
+// Motion source (nvof): instead of the block search, NVIDIA's optical-flow
+// hardware (NVOFA, Turing and later) can supply the vectors, one per 4x4
+// pixels in both directions; everything after the search stays the same.
 // Held frames (dedup=1, for animation drawn on twos or threes): runs of up
 // to holdmax identical frames are treated as one drawing, and the motion to
 // the next drawing is spread over the whole run, the held copies included.
@@ -40,6 +43,10 @@
 //   cannot see the content (occlusion), and where no vector fits at all the
 //   result fades to a plain frame blend (artifact masking).
 
+#define NOMINMAX
+#include <windows.h>
+
+#include <cuda.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -53,6 +60,7 @@
 #include <string>
 
 #include "VSHelper4.h"
+#include "nvOpticalFlowCuda.h"
 #include "VapourSynth4.h"
 
 #define CK(x)                                                                                 \
@@ -93,12 +101,14 @@ struct Params {
     float occsad = 2.f;  // scale of the match error that counts as occluded (0 = vector convergence only)
     int bars = 1;        // detect letterbox bars and keep them out of the interpolation
     int fades = 1;       // compensate brightness changes between frames when matching
+    float strength = 1.f; // 1 = even motion; lower keeps real frames on screen longer (film look)
     int dedup = 1;       // spread motion over held frames (animation on twos/threes)
     int holdmax = 3;     // longest run of identical frames that counts as one held drawing
     float dupth = 0.4f;  // mean difference (8-bit, quarter resolution) below which two frames are identical
     int prefilter = 0;   // blur radius (0-2) of the copy used for matching, against grain (no gain measured)
     float statics = 0.f; // adaptive mode: extra rule keeping unchanged pixels still (0 = off; adaptive already keeps subtitles intact)
     float barsth = 24.f; // brightest pixel (8-bit) a bar row or column may have
+    int nvof = 0;        // motion from NVIDIA's optical-flow hardware: 0 off, 1 fast, 2 medium, 3 slow (best)
     int device = 0;
 };
 
@@ -108,6 +118,7 @@ struct FrameInfo {
     int area[4] = {};   // active picture x0, y0, x1, y1 (luma)
     float gain = 1.f;   // brightness ratio B / A used for fade compensation
     int held = 1;       // source frames the motion was spread over (1 = no held frames)
+    int nvof = 0;       // vectors came from the optical-flow hardware
     int copied = 0;     // the output is a source frame as is
 };
 
@@ -174,6 +185,39 @@ __device__ __forceinline__ float bilinear(const float* __restrict__ p, int pitch
     float a = p[y0 * pitch + x0], b = p[y0 * pitch + x1];
     float c = p[y1 * pitch + x0], d = p[y1 * pitch + x1];
     return (a + (b - a) * fx) + ((c + (d - c) * fx) - (a + (b - a) * fx)) * fy;
+}
+
+// Optical-flow hardware input: 8-bit luma, brightness mapped onto the other frame
+__global__ void to_u8(const float* __restrict__ src, int w, int h, int pitch, Gain gain, uint8_t* __restrict__ dst,
+                      int dpitch) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x < w && y < h) dst[y * dpitch + x] = (uint8_t)min(max((int)lrintf(apply(gain, src[y * pitch + x])), 0), 255);
+}
+
+// Optical-flow hardware output (S10.5 fixed point per 4x4) to a vector field
+__global__ void flow_to_field(const NV_OF_FLOW_VECTOR* __restrict__ flow, int fpitch, int nbx, int nby,
+                              float2* __restrict__ out) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= nbx || y >= nby) return;
+    NV_OF_FLOW_VECTOR f = flow[y * fpitch + x];
+    out[y * nbx + x] = make_float2(f.flowx / 32.f, f.flowy / 32.f);
+}
+
+// Mean match error of each block along its vector, for occlusion and scene tests
+__global__ void block_sad(const float* __restrict__ cur, const float* __restrict__ ref, int pitch, Area ar,
+                          const float2* __restrict__ v, int nbx, int nby, int bs, Gain gain, float* __restrict__ sad) {
+    int bx = blockIdx.x * blockDim.x + threadIdx.x, by = blockIdx.y * blockDim.y + threadIdx.y;
+    if (bx >= nbx || by >= nby) return;
+    float2 m = v[by * nbx + bx];
+    float s = 0.f;
+    int n = 0;
+    for (int y = by * bs; y < by * bs + bs; y++)
+        for (int x = bx * bs; x < bx * bs + bs; x++) {
+            if (!inside(ar, x, y)) continue;
+            s += fabsf(apply(gain, cur[y * pitch + x]) - bilinear(ref, pitch, ar, x + m.x, y + m.y));
+            n++;
+        }
+    sad[by * nbx + bx] = n ? s / n : 0.f;
 }
 
 // Brightest pixel of each row (one block per row) and each column
@@ -723,6 +767,13 @@ public:
         fbs_ = splits_ ? sbs_[splits_ - 1] : p.blksize;
         fnbx_ = splits_ ? snbx_[splits_ - 1] : nbx_[0];
         fnby_ = splits_ ? snby_[splits_ - 1] : nby_[0];
+        // Optical-flow hardware, if asked for and available: its 4x4 vectors become the final grid
+        nvof_ = p.nvof && init_nvof();
+        if (nvof_) {
+            fbs_ = 4;
+            fnbx_ = (pw_[0] + 3) / 4;
+            fnby_ = (ph_[0] + 3) / 4;
+        }
         ntx_ = (pw_[0] + kTile - 1) / kTile;
         nty_ = (ph_[0] + kTile - 1) / kTile;
 
@@ -761,6 +812,10 @@ public:
                     CK(cudaMalloc(&q.finesad[d][k], sizeof(float) * snbx_[k] * snby_[k]));
                 }
                 CK(cudaMalloc(&q.occ[d], sizeof(float) * nbf));
+                if (nvof_) {
+                    CK(cudaMalloc(&q.nv[d], sizeof(float2) * nbf));
+                    CK(cudaMalloc(&q.nvsad[d], sizeof(float) * nbf));
+                }
             }
         }
         const int gside = 2 * kGlobalRadius + 1;
@@ -798,9 +853,12 @@ public:
                     cudaFree(q.finesad[d][k]);
                 }
                 cudaFree(q.occ[d]);
+                cudaFree(q.nv[d]);
+                cudaFree(q.nvsad[d]);
             }
         cudaFree(gcost_);
         cudaFreeHost(host_gcost_);
+        free_nvof();
         cudaFree(tmpv_);
         cudaFree(stats_);
         cudaFree(tv_);
@@ -834,8 +892,17 @@ public:
                 info.held = ib - ia;
             }
         }
-        if (tt <= 0.0 || !frame(ib)) {
-            const VSFrame* src = frame(ia);
+        // Film look: below full strength each real frame stays on screen for part
+        // of the gap, and the motion happens in the middle of it
+        if (p_.strength < 1.f) {
+            const double s = std::max((double)p_.strength, 0.0);
+            tt = s < 0.01 ? std::floor(tt + 0.5) : std::min(std::max((tt - (1.0 - s) / 2) / s, 0.0), 1.0);
+            // Positions that land on a hold boundary (common at 24 -> 60) are real frames
+            if (tt < 1e-3) tt = 0.0;
+            if (tt > 1.0 - 1e-3) tt = 1.0;
+        }
+        if (tt <= 0.0 || tt >= 1.0 || !frame(ib)) {
+            const VSFrame* src = tt >= 1.0 && frame(ib) ? frame(ib) : frame(ia);
             for (int i = 0; i < planes_; i++)
                 vsh::bitblt(vsapi->getWritePtr(dst, i), vsapi->getStride(dst, i), vsapi->getReadPtr(src, i),
                             vsapi->getStride(src, i), (size_t)pw_[i] * bytes_, ph_[i]);
@@ -860,6 +927,7 @@ public:
         info.area[2] = la.x1;
         info.area[3] = la.y1;
         info.gain = q.gain.gain;
+        info.nvof = nvof_;
         info.scene = q.over_threshold;
         const float neighbours = std::max(prev, next);
         // Floors keep noise in near-static footage (errors ~0.1) from counting as a spike
@@ -869,8 +937,8 @@ public:
         const dim3 blk(32, 8);
         const float scale = (float)(1 << (bits_ - 8));
         const int maxv = (1 << bits_) - 1;
-        FieldView fwd{q.final_v(0, splits_), q.occ[0], fnbx_, fnby_, fbs_};
-        FieldView bwd{q.final_v(1, splits_), q.occ[1], fnbx_, fnby_, fbs_};
+        FieldView fwd{field(q, 0), q.occ[0], fnbx_, fnby_, fbs_};
+        FieldView bwd{field(q, 1), q.occ[1], fnbx_, fnby_, fbs_};
         const bool adaptive = p_.mode == 2 && !info.scene;
         // Mismatch (8-bit) the best moving vector must leave before a pixel may
         // stay still; higher static setting = lower bar
@@ -937,6 +1005,8 @@ private:
         float2* fine[2][kMaxSplit] = {};   // after each block split
         float* finesad[2][kMaxSplit] = {};
         float* occ[2] = {};                // on the finest grid
+        float2* nv[2] = {};                // from the optical-flow hardware (nvof)
+        float* nvsad[2] = {};
         const float2* final_v(int d, int splits) const { return splits ? fine[d][splits - 1] : v[d][0]; }
         const float* final_sad(int d, int splits) const { return splits ? finesad[d][splits - 1] : sad0[d]; }
         Area area = {};          // active picture (letterbox bars excluded)
@@ -1187,6 +1257,90 @@ private:
         return make_float2((float)(best % side - radius), (float)(best / side - radius));
     }
 
+    const float2* field(const Pair& q, int d) const { return nvof_ ? q.nv[d] : q.final_v(d, splits_); }
+    const float* field_sad(const Pair& q, int d) const { return nvof_ ? q.nvsad[d] : q.final_sad(d, splits_); }
+
+    // Optical-flow hardware: one session per direction, so each keeps using
+    // its previous result as hints for the next pair
+    bool init_nvof() {
+        of_lib_ = LoadLibraryA("nvofapi64.dll");
+        if (!of_lib_) return false;
+        typedef NV_OF_STATUS(NVOFAPI * Create)(uint32_t, NV_OF_CUDA_API_FUNCTION_LIST*);
+        auto create = (Create)GetProcAddress(of_lib_, "NvOFAPICreateInstanceCuda");
+        if (!create || create(NV_OF_API_VERSION, &of_) != NV_OF_SUCCESS) return false;
+        CK(cudaFree(0));  // make sure the runtime's context exists
+        CUcontext ctx = nullptr;
+        if (cuCtxGetCurrent(&ctx) != CUDA_SUCCESS || !ctx) return false;
+        const NV_OF_PERF_LEVEL perf[4] = {NV_OF_PERF_LEVEL_FAST, NV_OF_PERF_LEVEL_FAST, NV_OF_PERF_LEVEL_MEDIUM,
+                                          NV_OF_PERF_LEVEL_SLOW};
+        NV_OF_INIT_PARAMS init = {};
+        init.width = pw_[0];
+        init.height = ph_[0];
+        init.outGridSize = NV_OF_OUTPUT_VECTOR_GRID_SIZE_4;
+        init.mode = NV_OF_MODE_OPTICALFLOW;
+        init.perfLevel = perf[p_.nvof];
+        NV_OF_BUFFER_DESCRIPTOR in = {(uint32_t)pw_[0], (uint32_t)ph_[0], NV_OF_BUFFER_USAGE_INPUT,
+                                      NV_OF_BUFFER_FORMAT_GRAYSCALE8};
+        NV_OF_BUFFER_DESCRIPTOR out = {(uint32_t)(pw_[0] + 3) / 4, (uint32_t)(ph_[0] + 3) / 4, NV_OF_BUFFER_USAGE_OUTPUT,
+                                       NV_OF_BUFFER_FORMAT_SHORT2};
+        for (int d = 0; d < 2; d++) {
+            if (of_.nvCreateOpticalFlowCuda(ctx, &of_h_[d]) != NV_OF_SUCCESS) return false;
+            if (of_.nvOFInit(of_h_[d], &init) != NV_OF_SUCCESS) return false;
+            for (int k = 0; k < 2; k++)
+                if (of_.nvOFCreateGPUBufferCuda(of_h_[d], &in, NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR, &of_in_[d][k]) !=
+                    NV_OF_SUCCESS)
+                    return false;
+            if (of_.nvOFCreateGPUBufferCuda(of_h_[d], &out, NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR, &of_out_[d]) !=
+                NV_OF_SUCCESS)
+                return false;
+            // The hardware works on the default stream; keep it in order with ours
+            of_.nvOFSetIOCudaStreams(of_h_[d], (CUstream)stream_, (CUstream)stream_);
+        }
+        NV_OF_CUDA_BUFFER_STRIDE_INFO si = {};
+        of_.nvOFGPUBufferGetStrideInfo(of_in_[0][0], &si);
+        of_in_pitch_ = si.strideInfo[0].strideXInBytes;
+        of_.nvOFGPUBufferGetStrideInfo(of_out_[0], &si);
+        of_out_pitch_ = si.strideInfo[0].strideXInBytes / sizeof(NV_OF_FLOW_VECTOR);
+        return true;
+    }
+
+    void free_nvof() {
+        for (int d = 0; d < 2; d++) {
+            if (!of_h_[d]) continue;
+            for (int k = 0; k < 2; k++)
+                if (of_in_[d][k]) of_.nvOFDestroyGPUBufferCuda(of_in_[d][k]);
+            if (of_out_[d]) of_.nvOFDestroyGPUBufferCuda(of_out_[d]);
+            of_.nvOFDestroy(of_h_[d]);
+        }
+        if (of_lib_) FreeLibrary(of_lib_);
+    }
+
+    // Direction d of pair q from the hardware: d = 0 matches A's pixels in B
+    void nvof_flow(const Slot& cur, const Slot& ref, Pair& q, int d) {
+        const dim3 blk(32, 8);
+        const Gain gain = d ? inverse(q.gain) : q.gain;
+        to_u8<<<grid2d(pw_[0], ph_[0], blk), blk, 0, stream_>>>(
+            cur.pyr[0], pw_[0], ph_[0], pw_[0], gain, (uint8_t*)of_.nvOFGPUBufferGetCUdeviceptr(of_in_[d][0]),
+            (int)of_in_pitch_);
+        to_u8<<<grid2d(pw_[0], ph_[0], blk), blk, 0, stream_>>>(
+            ref.pyr[0], pw_[0], ph_[0], pw_[0], Gain{1.f, 0.f}, (uint8_t*)of_.nvOFGPUBufferGetCUdeviceptr(of_in_[d][1]),
+            (int)of_in_pitch_);
+        CK(cudaGetLastError());
+        NV_OF_EXECUTE_INPUT_PARAMS ein = {};
+        ein.inputFrame = of_in_[d][0];
+        ein.referenceFrame = of_in_[d][1];
+        NV_OF_EXECUTE_OUTPUT_PARAMS eout = {};
+        eout.outputBuffer = of_out_[d];
+        if (of_.nvOFExecute(of_h_[d], &ein, &eout) != NV_OF_SUCCESS) throw std::runtime_error("optical flow failed");
+        const dim3 fblk(16, 16);
+        flow_to_field<<<grid2d(fnbx_, fnby_, fblk), fblk, 0, stream_>>>(
+            (const NV_OF_FLOW_VECTOR*)of_.nvOFGPUBufferGetCUdeviceptr(of_out_[d]), (int)of_out_pitch_, fnbx_, fnby_,
+            q.nv[d]);
+        block_sad<<<grid2d(fnbx_, fnby_, fblk), fblk, 0, stream_>>>(cur.pyr[0], ref.pyr[0], pw_[0], q.area, q.nv[d], fnbx_,
+                                                                    fnby_, fbs_, gain, q.nvsad[d]);
+        CK(cudaGetLastError());
+    }
+
     // Frames i and i+1 are the same picture: mean difference at quarter
     // resolution (grain and compression noise averaged out) under dupth
     bool identical(int i, const VSFrame* fa, const VSFrame* fb, const VSAPI* vsapi) {
@@ -1226,20 +1380,28 @@ private:
         q.area = detect_area(A, B);
         q.gain = fade_gain(A, B, q.area);
 
-        search(A, B, q, 0, prev);
-        search(B, A, q, 1, prev);
+        if (nvof_) {
+            nvof_flow(A, B, q, 0);
+            nvof_flow(B, A, q, 1);
+        } else {
+            search(A, B, q, 0, prev);
+            search(B, A, q, 1, prev);
+        }
 
-        const int nb = nbx_[0] * nby_[0];
+        // Scene statistics over the grid the vectors came from
+        const float* ssad = nvof_ ? q.nvsad[0] : q.sad0[0];
+        const int snbx = nvof_ ? fnbx_ : nbx_[0], sbs = nvof_ ? fbs_ : p_.blksize;
+        const int nb = nvof_ ? fnbx_ * fnby_ : nbx_[0] * nby_[0];
         const float th = p_.thscd1 / 64.f;  // thscd1 is an 8x8 block SAD; sad holds per-pixel means
         CK(cudaMemsetAsync(stats_, 0, 3 * sizeof(float), stream_));
-        scene_stats<<<(nb + 255) / 256, 256, 0, stream_>>>(q.sad0[0], nb, nbx_[0], p_.blksize, q.area, th, stats_);
+        scene_stats<<<(nb + 255) / 256, 256, 0, stream_>>>(ssad, nb, snbx, sbs, q.area, th, stats_);
         CK(cudaGetLastError());
 
         const dim3 blk(16, 16);
         const float inv_scale = 1.f / std::max(p_.ml * 0.16f, 1e-3f);  // ml=100: 16 px of convergence = fully occluded
         for (int d = 0; d < 2; d++) {
-            occlusion<<<grid2d(fnbx_, fnby_, blk), blk, 0, stream_>>>(q.final_v(d, splits_), q.final_sad(d, splits_),
-                                                                     q.occ[d], fnbx_, fnby_, inv_scale, p_.occsad);
+            occlusion<<<grid2d(fnbx_, fnby_, blk), blk, 0, stream_>>>(field(q, d), field_sad(q, d), q.occ[d], fnbx_,
+                                                                     fnby_, inv_scale, p_.occsad);
             CK(cudaGetLastError());
         }
         float stats[3] = {};
@@ -1261,6 +1423,12 @@ private:
     int ntx_ = 0, nty_ = 0;
     int splits_ = 0, sbs_[kMaxSplit] = {}, snbx_[kMaxSplit] = {}, snby_[kMaxSplit] = {};
     int fbs_ = 16, fnbx_ = 0, fnby_ = 0;  // finest vector grid
+    bool nvof_ = false;            // optical-flow hardware in use
+    HMODULE of_lib_ = nullptr;
+    NV_OF_CUDA_API_FUNCTION_LIST of_ = {};
+    NvOFHandle of_h_[2] = {};
+    NvOFGPUBufferHandle of_in_[2][2] = {}, of_out_[2] = {};
+    uint32_t of_in_pitch_ = 0, of_out_pitch_ = 0;
     float* gcost_ = nullptr;       // camera motion search costs, device and pinned host
     float* host_gcost_ = nullptr;
     Area stable_ = {}, candidate_ = {};  // letterbox bars in use, and the ones waiting to be confirmed
@@ -1303,6 +1471,7 @@ static void set_props(VSFrame* f, const FilterData* d, const FrameInfo* info, co
         vsapi->mapSetIntArray(props, "GpumvArea", area, 4);
         vsapi->mapSetFloat(props, "GpumvGain", info->gain, maReplace);
         vsapi->mapSetInt(props, "GpumvHeld", info->held, maReplace);
+        vsapi->mapSetInt(props, "GpumvNvof", info->nvof, maReplace);
     }
 }
 
@@ -1420,15 +1589,18 @@ static void VS_CC interp_create(const VSMap* in, VSMap* out, void*, VSCore* core
     p.fades = geti("fades", p.fades);
     p.prefilter = geti("prefilter", p.prefilter);
     p.dedup = geti("dedup", p.dedup);
+    p.strength = getf("strength", p.strength);
     p.holdmax = geti("holdmax", p.holdmax);
     p.dupth = getf("dupth", p.dupth);
     p.barsth = getf("barsth", p.barsth);
+    p.nvof = geti("nvof", p.nvof);
     p.device = geti("device", p.device);
     if (p.mode < 0 || p.mode > 2) return fail("mode must be 0 (block), 1 (flow) or 2 (adaptive)");
     if (p.blksize != 8 && p.blksize != 16 && p.blksize != 32) return fail("blksize must be 8, 16 or 32");
     if (p.pel != 1 && p.pel != 2) return fail("pel must be 1 or 2");
     if (p.prefilter < 0 || p.prefilter > 2) return fail("prefilter must be 0-2");
     if (p.holdmax < 2 || p.holdmax > 4) return fail("holdmax must be 2-4");
+    if (p.nvof < 0 || p.nvof > 3) return fail("nvof must be 0-3");
     if (p.radius < 1 || p.radius > 16 || p.refine < 0 || p.refine > 8) return fail("radius must be 1-16, refine 0-8");
 
     d->src_num = vi->fpsNum;
@@ -1457,10 +1629,10 @@ static void VS_CC interp_create(const VSMap* in, VSMap* out, void*, VSCore* core
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI* vspapi) {
     vspapi->configPlugin("com.mpv-portable.gpumv", "gpumv", "GPU motion-compensated frame interpolation",
-                         VS_MAKE_VERSION(0, 9), VAPOURSYNTH_API_VERSION, 0, plugin);
+                         VS_MAKE_VERSION(0, 11), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction("Interpolate",
                              "clip:vnode;num:int;den:int:opt;mode:int:opt;blksize:int:opt;pel:int:opt;radius:int:opt;"
                              "refine:int:opt;lambda:float:opt;lambdaflat:float:opt;texref:float:opt;smooth:int:opt;split:int:opt;thsad:int:opt;gmv:int:opt;temporal:int:opt;blend:int:opt;thscd1:int:opt;"
-                             "thscd2:int:opt;scratio:float:opt;ml:float:opt;mask:float:opt;occsad:float:opt;bars:int:opt;barsth:float:opt;static:float:opt;fades:int:opt;prefilter:int:opt;dedup:int:opt;holdmax:int:opt;dupth:float:opt;device:int:opt;",
+                             "thscd2:int:opt;scratio:float:opt;ml:float:opt;mask:float:opt;occsad:float:opt;bars:int:opt;barsth:float:opt;static:float:opt;fades:int:opt;prefilter:int:opt;nvof:int:opt;dedup:int:opt;holdmax:int:opt;strength:float:opt;dupth:float:opt;device:int:opt;",
                              "clip:vnode;", interp_create, nullptr, plugin);
 }

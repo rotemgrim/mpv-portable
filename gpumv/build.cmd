@@ -13,7 +13,7 @@ call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
 
 if not exist build mkdir build
 rem sm_120 native code for RTX 50, PTX for older GPUs (JIT-compiled by the driver)
-nvcc -O3 -std=c++17 -shared -o build\gpumv.dll src\gpumv.cu -Iinclude ^
+nvcc -O3 -std=c++17 -shared -o build\gpumv.dll src\gpumv.cu -Iinclude -lcuda ^
     -Xcompiler "/MD /O2 /W3" ^
     -gencode arch=compute_75,code=compute_75 ^
     -gencode arch=compute_120,code=sm_120 || exit /b 1

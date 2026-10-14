@@ -35,9 +35,11 @@ max_fps = cfg_float("max_fps", 120)
 # gpumv_anime.vpy (Ctrl+9) runs this script with ANIME set: flat line art wants
 # bigger blocks and a more coherent vector field than live action
 anime = globals().get("ANIME", False)
-tuned = (("gpumv_anime_blksize", 32), ("gpumv_anime_lambda", 2.0), ("gpumv_anime_mask", 1.0)) if anime else \
-        (("gpumv_blksize", 16), ("gpumv_lambda", 0.1), ("gpumv_mask", 0.5))
-blksize, lam, mask = cfg_int(*tuned[0]), cfg_float(*tuned[1]), cfg_float(*tuned[2])
+# Films use the optical-flow hardware for motion (falls back to the own search
+# on GPUs without it); the anime settings need the own search
+tuned = (("gpumv_anime_blksize", 32), ("gpumv_anime_lambda", 2.0), ("gpumv_anime_mask", 1.0), ("gpumv_anime_nvof", 0)) \
+    if anime else (("gpumv_blksize", 16), ("gpumv_lambda", 0.1), ("gpumv_mask", 0.5), ("gpumv_nvof", 2))
+blksize, lam, mask, nvof = cfg_int(*tuned[0]), cfg_float(*tuned[1]), cfg_float(*tuned[2]), cfg_int(*tuned[3])
 
 clip = video_in
 
@@ -61,6 +63,8 @@ if dst > clip.fps:
         dedup=cfg_int("gpumv_dedup", 1),
         bars=cfg_int("gpumv_bars", 1),
         fades=cfg_int("gpumv_fades", 1),
+        nvof=nvof,
+        strength=cfg_float("gpumv_strength", 1.0),
     )
 
 clip.set_output()
