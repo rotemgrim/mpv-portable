@@ -215,8 +215,13 @@ local function apply_and_reload()
         if f.name == "vapoursynth" then
             found = true
             -- Detect which script is active
-            if f.params and f.params.file and f.params.file:find("rife") then
+            local file = f.params and f.params.file or ""
+            if file:find("rife") then
                 found_mode = "rife"
+            elseif file:find("gpumv") then
+                found_mode = "gpumv"
+            elseif file:find("svp") then
+                found_mode = "svp"
             else
                 found_mode = "motion"
             end

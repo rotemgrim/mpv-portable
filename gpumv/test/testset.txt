@@ -1,0 +1,12 @@
+# Real-footage test set for testset.py: label | file | start (time or % of the film)
+# Paths are this PC's; edit freely. Scenes are 3 s, scaled to 1920 wide, 8-bit.
+action-1    | B:/complete/A.Working.Man.2025.2160p.WEB-DL.DV.HDR10+.DDP5.1.Atmos.H265.MP4-BEN.THE.MEN/A.Working.Man.2025.2160p.WEB-DL.DV.HDR10+[Ben The Men].mp4 | 62%
+action-2    | B:/complete/A.Working.Man.2025.2160p.WEB-DL.DV.HDR10+.DDP5.1.Atmos.H265.MP4-BEN.THE.MEN/A.Working.Man.2025.2160p.WEB-DL.DV.HDR10+[Ben The Men].mp4 | 81%
+anime-1     | B:/complete/1980s ANIME Movies (Pack 2) - 10 Films-OVAs from 1982-1989 - 1080p BluRay DUAL AUDIO x264/02a. Golgo 13 - The Professional (1983)/Golgo 13 - The Professional (1983 BluRay - 1080p QUAD Audio).mkv | 30%
+anime-2     | B:/complete/1980s ANIME Movies (Pack 2) - 10 Films-OVAs from 1982-1989 - 1080p BluRay DUAL AUDIO x264/02a. Golgo 13 - The Professional (1983)/Golgo 13 - The Professional (1983 BluRay - 1080p QUAD Audio).mkv | 70%
+drama-1     | B:/complete/A Star Is Born (2018) [WEBRip] [1080p] [YTS.AM]/A.Star.Is.Born.2018.1080p.WEBRip.x264-[YTS.AM].mp4 | 25%
+drama-2     | B:/complete/A Star Is Born (2018) [WEBRip] [1080p] [YTS.AM]/A.Star.Is.Born.2018.1080p.WEBRip.x264-[YTS.AM].mp4 | 55%
+grain-1     | B:/complete/Ace.Ventura.Pet.Detective.1994.1080p.BluRay.x264-RiPPY/Ace.Ventura.Pet.Detective.1994.1080p.BluRay.x264-RiPPY.mkv | 40%
+grain-2     | B:/complete/Ace.Ventura.Pet.Detective.1994.1080p.BluRay.x264-RiPPY/Ace.Ventura.Pet.Detective.1994.1080p.BluRay.x264-RiPPY.mkv | 75%
+dark-1      | B:/complete/28.Years.Later.2025.2160p.AMZN.WEB-DL.HDR10+.ENG.LATINO.DDP5.1.Atmos.H265-BEN.THE.MEN/28.Years.Later.2025.2160p.AMZN.WEB-DL.HDR10+[Ben The Men].mkv | 45%
+dark-2      | B:/complete/28.Years.Later.2025.2160p.AMZN.WEB-DL.HDR10+.ENG.LATINO.DDP5.1.Atmos.H265-BEN.THE.MEN/28.Years.Later.2025.2160p.AMZN.WEB-DL.HDR10+[Ben The Men].mkv | 70%

@@ -7,6 +7,7 @@ local filters = {
     motion = 'vapoursynth="~~/motion.vpy":buffered-frames=8',
     rife   = 'vapoursynth="~~/rife.vpy":buffered-frames=4:concurrent-frames=4',
     svp    = 'vapoursynth="~~/svp.vpy":buffered-frames=8:concurrent-frames=8',
+    gpumv  = 'vapoursynth="~~/gpumv.vpy":buffered-frames=8',
 }
 
 local fps_file = mp.command_native({"expand-path", "~~/cache/measured_fps.txt"})

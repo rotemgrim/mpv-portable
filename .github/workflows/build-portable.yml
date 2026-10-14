@@ -49,8 +49,9 @@ jobs:
           # Layer the small text/config/script files from the repo on top of the
           # extracted binary payload. Repo files take precedence (configs may have
           # been edited since the payload was built).
+          # gpumv/ is the plugin's source and tests; its built DLL ships in the payload.
           robocopy . $staging /E `
-            /XD .git .github .idea .claude tools `
+            /XD .git .github .idea .claude tools gpumv `
             /XF .gitattributes .gitignore bootstrap.ps1 *.log payload.7z payload.7z.sha256
           if ($LASTEXITCODE -ge 8) { exit $LASTEXITCODE } else { $global:LASTEXITCODE = 0 }
           # Sanity check: critical binaries must be present after the merge.
