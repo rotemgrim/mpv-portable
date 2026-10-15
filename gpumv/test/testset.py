@@ -21,11 +21,13 @@ python = os.path.join(root, "bin", "python.exe")
 work = sys.argv[1]
 rest = sys.argv[2:]
 methods = [a for a in rest if "=" not in a] or ["mvtools", "gpumv-flow", "gpumv-adaptive"]
-settings = [a for a in rest if "=" in a]
+# list=<file> uses another scene list than testset.txt
+scene_list = next((a.split("=", 1)[1] for a in rest if a.startswith("list=")), os.path.join(here, "testset.txt"))
+settings = [a for a in rest if "=" in a and not a.startswith("list=")]
 os.makedirs(work, exist_ok=True)
 
 scenes = []
-for line in open(os.path.join(here, "testset.txt"), encoding="utf-8"):
+for line in open(scene_list, encoding="utf-8"):
     line = line.strip()
     if line and not line.startswith("#"):
         label, path, start = (p.strip() for p in line.split("|"))

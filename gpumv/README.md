@@ -14,20 +14,19 @@ video at once, with a live status line. Or use **Ctrl+8**, and **Ctrl+9** for an
 
 ### Live action and animation
 
-The two want opposite settings, so they are separate modes:
-
 | | Ctrl+8 (default) | Ctrl+9 (anime) |
 |---|---|---|
+| Motion source | optical-flow hardware (`nvof=2`) | block search |
 | `blksize` | 16 | 32 |
-| `lambda` | 0.1 | 2.0 |
+| `lambda` | 0.1 | 0.5 |
 | `mask` | 0.5 | 1.0 |
-| Live-action scenes (8) | best | up to 3.4 dB worse |
-| Anime scenes (2), vs MVTools 34.15 dB | 33.37 dB | 34.23 dB |
+| `satd` | off | on |
 
-Flat line art matches equally well almost anywhere, so it needs a much more coherent vector
-field; live action has real, varied motion that strong coherence smooths away. Choosing the
-coherence per block by texture (`lambdaflat`) doesn't replace the two modes: live action's
-motion blur, soft backgrounds and dark areas look as flat as anime's colour fills.
+On 11 animation scenes (`test	estset_animation.txt`: Avatar series and 2026 film, ARK, Totoro,
+Cobra, Golgo 13) Ctrl+9 averages 36.51 dB against 36.13 for Ctrl+8: level on Avatar (37.61 vs
+37.59), +0.7 dB on 1980s anime. An earlier, much more coherent setting (`lambda=2.0`, `pnew=100`)
+tuned on two Golgo 13 scenes only was better on old anime but placed characters wrongly during
+camera moves in Avatar (-1 dB there, -4.5 dB on one scene).
 
 ## Build
 
@@ -190,12 +189,14 @@ Feature tests:
 | Still shot left untouched | — | 99 dB (exact) |
 | Real anime on twos, frames spread at 24 -> 60 | — | 71 of 174 (0 on live action) |
 
-Speed, 4K 23.976 -> 120 fps inside VapourSynth: gpumv adaptive 308 fps, gpumv flow 592,
+Speed, 4K 23.976 -> 120 fps inside VapourSynth (before parallel rendering; with it, Ctrl+8 runs at
+440 fps at 4K and 919 at 1080p, the own search at 340 and 1130): gpumv adaptive 308 fps, gpumv flow 592,
 MVTools Ctrl+3 settings 204, MVTools bs16 overlap8 pel2 74.
 
 ## Known limits
 
-- One CUDA stream, frames processed one at a time (`fmParallelRequests`)
+- Analysis (uploads, motion, scene tests) runs one frame at a time; rendering and the copy out run up
+  to 3 output frames in parallel, each on its own CUDA stream
 - NVIDIA only
 - No overlapped blocks; flow mode interpolates vectors between block centres instead
 - Brightness flashes count as scene changes (no interpolation across them)

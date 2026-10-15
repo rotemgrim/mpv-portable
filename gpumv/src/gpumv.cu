@@ -36,6 +36,9 @@
 // to holdmax identical frames are treated as one drawing, and the motion to
 // the next drawing is spread over the whole run, the held copies included.
 // Longer runs are a still shot and stay as they are.
+// Output frames are produced in parallel: analysis (uploads, motion, scene
+// tests) runs one at a time on one stream, rendering and the copy out run on
+// one of kRenderers streams each, overlapping the next frame's analysis.
 // Per output frame at time t in (0, 1):
 //   modes 0 (block) and 1 (flow): pixel p = (1-t)*A(p - t*vF) + t*B(p - (1-t)*vB)
 //   with block or per-pixel interpolated vectors, MVTools style.
@@ -57,6 +60,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <condition_variable>
 #include <map>
 #include <vector>
 #include <mutex>
@@ -81,8 +85,9 @@
     } while (0)
 
 static constexpr int kMaxLevels = 8;
-static constexpr int kSlots = 10;  // uploaded source frames kept on the GPU (held-frame window and a spare)
-static constexpr int kPairs = 4;   // motion fields kept on the GPU (previous, current, next and a spare)
+static constexpr int kSlots = 12;  // uploaded source frames on the GPU (held-frame window, frames being rendered)
+static constexpr int kPairs = 6;   // motion fields on the GPU (previous, current, next, ones being rendered)
+static constexpr int kRenderers = 3;  // output frames rendered and copied out at the same time
 static constexpr int kTile = 8;   // adaptive mode vector tile, in luma pixels
 static constexpr int kMaxSplit = 2;
 static constexpr int kGlobalRadius = 32;  // most camera motion search range at the coarsest level
@@ -917,9 +922,7 @@ public:
             total_ += (size_t)pw_[i] * ph_[i] * bytes_;
         }
         CK(cudaMalloc(&raw_, total_));
-        CK(cudaMalloc(&out_, total_));
         CK(cudaHostAlloc(&host_in_, total_, cudaHostAllocDefault));
-        CK(cudaHostAlloc(&host_out_, total_, cudaHostAllocDefault));
         for (auto& s : slots_) {
             for (int i = 0; i < planes_; i++) CK(cudaMalloc(&s.plane[i], sizeof(float) * pw_[i] * ph_[i]));
             if (p.prefilter)
@@ -956,17 +959,21 @@ public:
         CK(cudaHostAlloc(&host_gcost_, sizeof(float) * gside * gside, cudaHostAllocDefault));
         CK(cudaMalloc(&tmpv_, sizeof(float2) * nb0));
         CK(cudaMalloc(&stats_, 3 * sizeof(float)));
-        CK(cudaMalloc(&tv_, sizeof(float2) * ntx_ * nty_));
-        CK(cudaMalloc(&tcost_, sizeof(float) * ntx_ * nty_));
+        for (auto& r : renderers_) {
+            CK(cudaStreamCreateWithFlags(&r.stream, cudaStreamNonBlocking));
+            CK(cudaEventCreateWithFlags(&r.ready, cudaEventDisableTiming));
+            CK(cudaMalloc(&r.out, total_));
+            CK(cudaHostAlloc(&r.host_out, total_, cudaHostAllocDefault));
+            CK(cudaMalloc(&r.tv, sizeof(float2) * ntx_ * nty_));
+            CK(cudaMalloc(&r.tcost, sizeof(float) * ntx_ * nty_));
+        }
     }
 
     ~Engine() {
         cudaSetDevice(p_.device);
         cudaStreamSynchronize(stream_);
         cudaFree(raw_);
-        cudaFree(out_);
         cudaFreeHost(host_in_);
-        cudaFreeHost(host_out_);
         for (auto& s : slots_) {
             for (int i = 0; i < planes_; i++) cudaFree(s.plane[i]);
             if (p_.prefilter) cudaFree(s.pyr[0]);
@@ -995,84 +1002,127 @@ public:
         free_nvof();
         cudaFree(tmpv_);
         cudaFree(stats_);
-        cudaFree(tv_);
-        cudaFree(tcost_);
+        for (auto& r : renderers_) {
+            if (r.stream) cudaStreamSynchronize(r.stream);
+            cudaFree(r.out);
+            cudaFreeHost(r.host_out);
+            cudaFree(r.tv);
+            cudaFree(r.tcost);
+            if (r.ready) cudaEventDestroy(r.ready);
+            if (r.stream) cudaStreamDestroy(r.stream);
+        }
         cudaStreamDestroy(stream_);
     }
 
     // f[i] is source frame base + i (null outside the clip); pos is the output
-    // frame's position in source frames
+    // frame's position in source frames. Safe to call from several threads.
     FrameInfo interpolate(const VSFrame* const* f, int base, int count, double pos, VSFrame* dst,
                           const VSAPI* vsapi) {
-        std::lock_guard<std::mutex> lock(mutex_);
         CK(cudaSetDevice(p_.device));
+        Renderer& rd = acquire();
+        struct Release {
+            Engine* e;
+            Renderer& r;
+            ~Release() { e->release(r); }
+        } release_renderer{this, rd};
+
         auto frame = [&](int i) -> const VSFrame* { return i >= base && i < base + count ? f[i - base] : nullptr; };
-        const int k = (int)std::floor(pos);
-        int ia = k, ib = k + 1;
-        double tt = pos - k;
         FrameInfo info;
-        if (p_.dedup) {
-            // The run of identical frames around k, and whether it is short enough
-            // to be a held drawing rather than a still shot
-            auto dup = [&](int i) { return frame(i) && frame(i + 1) && identical(i, frame(i), frame(i + 1), vsapi); };
-            int s0 = k, e0 = k;
-            while (e0 - s0 + 1 < p_.holdmax && dup(s0 - 1)) s0--;
-            while (e0 - s0 + 1 < p_.holdmax && dup(e0)) e0++;
-            const bool still = dup(e0) || dup(s0 - 1);
-            if (e0 > s0 && !still && frame(e0 + 1)) {
-                ia = s0;
-                ib = e0 + 1;
-                tt = (pos - s0) / (ib - ia);
-                info.held = ib - ia;
+        Slot* A = nullptr;
+        Slot* B = nullptr;
+        Pair* q = nullptr;
+        float t = 0.f;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const int k = (int)std::floor(pos);
+            int ia = k, ib = k + 1;
+            double tt = pos - k;
+            if (p_.dedup) {
+                // The run of identical frames around k, and whether it is short enough
+                // to be a held drawing rather than a still shot
+                auto dup = [&](int i) { return frame(i) && frame(i + 1) && identical(i, frame(i), frame(i + 1), vsapi); };
+                int s0 = k, e0 = k;
+                while (e0 - s0 + 1 < p_.holdmax && dup(s0 - 1)) s0--;
+                while (e0 - s0 + 1 < p_.holdmax && dup(e0)) e0++;
+                const bool still = dup(e0) || dup(s0 - 1);
+                if (e0 > s0 && !still && frame(e0 + 1)) {
+                    ia = s0;
+                    ib = e0 + 1;
+                    tt = (pos - s0) / (ib - ia);
+                    info.held = ib - ia;
+                }
             }
-        }
-        // Film look: below full strength each real frame stays on screen for part
-        // of the gap, and the motion happens in the middle of it
-        if (p_.strength < 1.f) {
-            const double s = std::max((double)p_.strength, 0.0);
-            tt = s < 0.01 ? std::floor(tt + 0.5) : std::min(std::max((tt - (1.0 - s) / 2) / s, 0.0), 1.0);
-            // Positions that land on a hold boundary (common at 24 -> 60) are real frames
-            if (tt < 1e-3) tt = 0.0;
-            if (tt > 1.0 - 1e-3) tt = 1.0;
-        }
-        if (tt <= 0.0 || tt >= 1.0 || !frame(ib)) {
-            const VSFrame* src = tt >= 1.0 && frame(ib) ? frame(ib) : frame(ia);
-            for (int i = 0; i < planes_; i++)
-                vsh::bitblt(vsapi->getWritePtr(dst, i), vsapi->getStride(dst, i), vsapi->getReadPtr(src, i),
-                            vsapi->getStride(src, i), (size_t)pw_[i] * bytes_, ph_[i]);
-            info.copied = 1;
-            return info;
-        }
-        const float t = (float)tt;
-        // Upload and compute in this order so the frames and fields used
-        // below are the most recently touched and can't be evicted
-        Slot* P = frame(ia - 1) ? &upload(frame(ia - 1), ia - 1, vsapi) : nullptr;
-        Slot& A = upload(frame(ia), ia, vsapi);
-        Slot& B = upload(frame(ib), ib, vsapi);
-        Slot* N = frame(ib + 1) ? &upload(frame(ib + 1), ib + 1, vsapi) : nullptr;
-        float prev = P ? motion(*P, A, ia - 1, ia).score : -1.f;
-        float next = N ? motion(B, *N, ib, ib + 1).score : -1.f;
-        Pair& q = motion(A, B, ia, ib);
+            // Film look: below full strength each real frame stays on screen for part
+            // of the gap, and the motion happens in the middle of it
+            if (p_.strength < 1.f) {
+                const double s = std::max((double)p_.strength, 0.0);
+                tt = s < 0.01 ? std::floor(tt + 0.5) : std::min(std::max((tt - (1.0 - s) / 2) / s, 0.0), 1.0);
+                // Positions that land on a hold boundary (common at 24 -> 60) are real frames
+                if (tt < 1e-3) tt = 0.0;
+                if (tt > 1.0 - 1e-3) tt = 1.0;
+            }
+            if (tt <= 0.0 || tt >= 1.0 || !frame(ib)) {
+                const VSFrame* src = tt >= 1.0 && frame(ib) ? frame(ib) : frame(ia);
+                for (int i = 0; i < planes_; i++)
+                    vsh::bitblt(vsapi->getWritePtr(dst, i), vsapi->getStride(dst, i), vsapi->getReadPtr(src, i),
+                                vsapi->getStride(src, i), (size_t)pw_[i] * bytes_, ph_[i]);
+                info.copied = 1;
+                return info;
+            }
+            t = (float)tt;
+            // Upload and compute in this order so the frames and fields used
+            // below are the most recently touched and can't be evicted
+            Slot* P = frame(ia - 1) ? &upload(frame(ia - 1), ia - 1, vsapi) : nullptr;
+            Slot& a = upload(frame(ia), ia, vsapi);
+            Slot& b = upload(frame(ib), ib, vsapi);
+            Slot* N = frame(ib + 1) ? &upload(frame(ib + 1), ib + 1, vsapi) : nullptr;
+            float prev = P ? motion(*P, a, ia - 1, ia).score : -1.f;
+            float next = N ? motion(b, *N, ib, ib + 1).score : -1.f;
+            Pair& qq = motion(a, b, ia, ib);
 
-        info.score = q.score;
-        const Area la = q.area;
-        info.area[0] = la.x0;
-        info.area[1] = la.y0;
-        info.area[2] = la.x1;
-        info.area[3] = la.y1;
-        info.gain = q.gain.gain;
-        info.nvof = nvof_;
-        info.scene = q.over_threshold;
-        const float neighbours = std::max(prev, next);
-        // Floors keep noise in near-static footage (errors ~0.1) from counting as a spike
-        if (p_.scratio > 0.f && neighbours >= 0.f && q.score > 1.5f && q.score > p_.scratio * std::max(neighbours, 0.25f))
-            info.scene = 1;
+            info.score = qq.score;
+            info.area[0] = qq.area.x0;
+            info.area[1] = qq.area.y0;
+            info.area[2] = qq.area.x1;
+            info.area[3] = qq.area.y1;
+            info.gain = qq.gain.gain;
+            info.nvof = nvof_;
+            info.scene = qq.over_threshold;
+            const float neighbours = std::max(prev, next);
+            // Floors keep noise in near-static footage (errors ~0.1) from counting as a spike
+            if (p_.scratio > 0.f && neighbours >= 0.f && qq.score > 1.5f &&
+                qq.score > p_.scratio * std::max(neighbours, 0.25f))
+                info.scene = 1;
+            // In use until this frame is rendered: the caches must not reuse them
+            A = &a;
+            B = &b;
+            q = &qq;
+            A->pins++;
+            B->pins++;
+            q->pins++;
+            CK(cudaEventRecord(rd.ready, stream_));
+        }
+        struct Unpin {
+            Engine* e;
+            Slot* a;
+            Slot* b;
+            Pair* q;
+            ~Unpin() {
+                std::lock_guard<std::mutex> lock(e->mutex_);
+                a->pins--;
+                b->pins--;
+                q->pins--;
+            }
+        } unpin{this, A, B, q};
 
+        // Rendering, on this renderer's stream, once the analysis above is done
+        CK(cudaStreamWaitEvent(rd.stream, rd.ready, 0));
+        const Area la = q->area;
         const dim3 blk(32, 8);
         const float scale = (float)(1 << (bits_ - 8));
         const int maxv = (1 << bits_) - 1;
-        FieldView fwd{field(q, 0), q.occ[0], fnbx_, fnby_, fbs_};
-        FieldView bwd{field(q, 1), q.occ[1], fnbx_, fnby_, fbs_};
+        FieldView fwd{field(*q, 0), q->occ[0], fnbx_, fnby_, fbs_};
+        FieldView bwd{field(*q, 1), q->occ[1], fnbx_, fnby_, fbs_};
         const bool adaptive = p_.mode == 2 && !info.scene;
         // Mismatch (8-bit) the best moving vector must leave before a pixel may
         // stay still; higher static setting = lower bar
@@ -1080,49 +1130,91 @@ public:
         if (adaptive) {
             const int nt = ntx_ * nty_;
             const dim3 tblk(32, 4);
-            select_vectors<<<(nt + tblk.y - 1) / tblk.y, tblk, 0, stream_>>>(
-                A.pyr[0], B.pyr[0], pw_[0], la, q.gain, fwd, bwd, t, ntx_, nty_, tv_, tcost_);
+            select_vectors<<<(nt + tblk.y - 1) / tblk.y, tblk, 0, rd.stream>>>(
+                A->pyr[0], B->pyr[0], pw_[0], la, q->gain, fwd, bwd, t, ntx_, nty_, rd.tv, rd.tcost);
             CK(cudaGetLastError());
         }
         for (int i = 0; i < planes_; i++) {
             int sx = i ? ssx_ : 0, sy = i ? ssy_ : 0;
-            void* o = (uint8_t*)out_ + off_[i];
+            void* o = (uint8_t*)rd.out + off_[i];
             const Area pa = plane_area(la, i);
             if (p_.mode == 2) {
                 if (bytes_ == 1)
-                    render_adaptive<uint8_t><<<grid2d(pw_[i], ph_[i], blk), blk, 0, stream_>>>(
-                        A.plane[i], B.plane[i], pw_[i], ph_[i], pw_[i], pa, sx, sy, A.pyr[0], B.pyr[0], pw_[0],
-                        ph_[0], la, q.gain, tv_, tcost_, ntx_, nty_, fwd, bwd, t, info.scene, p_.blend, p_.mask, keep_static, (uint8_t*)o,
-                        pw_[i], scale, maxv);
+                    render_adaptive<uint8_t><<<grid2d(pw_[i], ph_[i], blk), blk, 0, rd.stream>>>(
+                        A->plane[i], B->plane[i], pw_[i], ph_[i], pw_[i], pa, sx, sy, A->pyr[0], B->pyr[0], pw_[0],
+                        ph_[0], la, q->gain, rd.tv, rd.tcost, ntx_, nty_, fwd, bwd, t, info.scene, p_.blend, p_.mask,
+                        keep_static, (uint8_t*)o, pw_[i], scale, maxv);
                 else
-                    render_adaptive<uint16_t><<<grid2d(pw_[i], ph_[i], blk), blk, 0, stream_>>>(
-                        A.plane[i], B.plane[i], pw_[i], ph_[i], pw_[i], pa, sx, sy, A.pyr[0], B.pyr[0], pw_[0],
-                        ph_[0], la, q.gain, tv_, tcost_, ntx_, nty_, fwd, bwd, t, info.scene, p_.blend, p_.mask, keep_static, (uint16_t*)o,
-                        pw_[i], scale, maxv);
+                    render_adaptive<uint16_t><<<grid2d(pw_[i], ph_[i], blk), blk, 0, rd.stream>>>(
+                        A->plane[i], B->plane[i], pw_[i], ph_[i], pw_[i], pa, sx, sy, A->pyr[0], B->pyr[0], pw_[0],
+                        ph_[0], la, q->gain, rd.tv, rd.tcost, ntx_, nty_, fwd, bwd, t, info.scene, p_.blend, p_.mask,
+                        keep_static, (uint16_t*)o, pw_[i], scale, maxv);
             } else {
                 if (bytes_ == 1)
-                    render<uint8_t><<<grid2d(pw_[i], ph_[i], blk), blk, 0, stream_>>>(
-                        A.plane[i], B.plane[i], pw_[i], ph_[i], pw_[i], pa, sx, sy, fwd, bwd, p_.mode, t, info.scene,
+                    render<uint8_t><<<grid2d(pw_[i], ph_[i], blk), blk, 0, rd.stream>>>(
+                        A->plane[i], B->plane[i], pw_[i], ph_[i], pw_[i], pa, sx, sy, fwd, bwd, p_.mode, t, info.scene,
                         p_.blend, (uint8_t*)o, pw_[i], scale, maxv);
                 else
-                    render<uint16_t><<<grid2d(pw_[i], ph_[i], blk), blk, 0, stream_>>>(
-                        A.plane[i], B.plane[i], pw_[i], ph_[i], pw_[i], pa, sx, sy, fwd, bwd, p_.mode, t, info.scene,
+                    render<uint16_t><<<grid2d(pw_[i], ph_[i], blk), blk, 0, rd.stream>>>(
+                        A->plane[i], B->plane[i], pw_[i], ph_[i], pw_[i], pa, sx, sy, fwd, bwd, p_.mode, t, info.scene,
                         p_.blend, (uint16_t*)o, pw_[i], scale, maxv);
             }
             CK(cudaGetLastError());
         }
-        CK(cudaMemcpyAsync(host_out_, out_, total_, cudaMemcpyDeviceToHost, stream_));
-        CK(cudaStreamSynchronize(stream_));
+        CK(cudaMemcpyAsync(rd.host_out, rd.out, total_, cudaMemcpyDeviceToHost, rd.stream));
+        CK(cudaStreamSynchronize(rd.stream));
         for (int i = 0; i < planes_; i++)
-            vsh::bitblt(vsapi->getWritePtr(dst, i), vsapi->getStride(dst, i), host_out_ + off_[i],
+            vsh::bitblt(vsapi->getWritePtr(dst, i), vsapi->getStride(dst, i), rd.host_out + off_[i],
                         (ptrdiff_t)pw_[i] * bytes_, (size_t)pw_[i] * bytes_, ph_[i]);
         return info;
     }
 
 private:
+    // Render resources of one output frame in flight
+    struct Renderer {
+        cudaStream_t stream = nullptr;
+        cudaEvent_t ready = nullptr;  // the frame's analysis has finished on stream_
+        void* out = nullptr;
+        uint8_t* host_out = nullptr;
+        float2* tv = nullptr;         // adaptive mode tile vectors
+        float* tcost = nullptr;
+        bool busy = false;
+    };
+
+    Renderer& acquire() {
+        std::unique_lock<std::mutex> lock(pool_mutex_);
+        for (;;) {
+            for (auto& r : renderers_)
+                if (!r.busy) {
+                    r.busy = true;
+                    return r;
+                }
+            pool_cv_.wait(lock);
+        }
+    }
+
+    void release(Renderer& r) {
+        {
+            std::lock_guard<std::mutex> lock(pool_mutex_);
+            r.busy = false;
+        }
+        pool_cv_.notify_one();
+    }
+
+    // Least recently used entry nothing is rendering from
+    template <typename T, int N>
+    static T& evictable(T (&items)[N]) {
+        T* best = nullptr;
+        for (auto& it : items)
+            if (!it.pins && (!best || it.used < best->used)) best = &it;
+        if (!best) throw std::runtime_error("all GPU caches are in use");
+        return *best;
+    }
+
     struct Slot {
         int idx = -1;
         uint64_t used = 0;
+        int pins = 0;  // output frames still rendering from this frame
         float* plane[3] = {};
         float* pyr[kMaxLevels] = {};  // matching pyramid; level 0 is plane[0] or its blurred copy
         float* rmax = nullptr;  // brightest luma per row / column, device
@@ -1134,6 +1226,7 @@ private:
     struct Pair {
         int a = -1, b = -1;  // source frames
         uint64_t used = 0;
+        int pins = 0;        // output frames still rendering from these fields
         float2* v[2][kMaxLevels] = {};     // pyramid vectors, [0] forward A->B, [1] backward B->A
         float* sad0[2] = {};               // full-resolution match error per block
         float2* fine[2][kMaxSplit] = {};   // after each block split
@@ -1156,7 +1249,7 @@ private:
                 s.used = tick_;
                 return s;
             }
-        Slot& s = *std::min_element(slots_, slots_ + kSlots, [](const Slot& a, const Slot& b) { return a.used < b.used; });
+        Slot& s = evictable(slots_);
         s.idx = idx;
         s.used = tick_;
 
@@ -1583,7 +1676,7 @@ private:
                 q.used = tick_;
                 return q;
             }
-        Pair& q = *std::min_element(pairs_, pairs_ + kPairs, [](const Pair& x, const Pair& y) { return x.used < y.used; });
+        Pair& q = evictable(pairs_);
         q.a = a;
         q.b = b;
         q.used = tick_;
@@ -1651,13 +1744,12 @@ private:
     int candidate_count_ = 0;
     size_t off_[3] = {}, total_ = 0;
     void* raw_ = nullptr;
-    void* out_ = nullptr;
     uint8_t* host_in_ = nullptr;
-    uint8_t* host_out_ = nullptr;
     float2* tmpv_ = nullptr;
     float* stats_ = nullptr;
-    float2* tv_ = nullptr;
-    float* tcost_ = nullptr;
+    Renderer renderers_[kRenderers];
+    std::mutex pool_mutex_;
+    std::condition_variable pool_cv_;
     Slot slots_[kSlots];
     Pair pairs_[kPairs];
     std::map<int, bool> identical_;  // held-frame test results by first frame
@@ -1848,13 +1940,13 @@ static void VS_CC interp_create(const VSMap* in, VSMap* out, void*, VSCore* core
 
     VSFilterDependency deps[] = {{d->node, rpGeneral}};
     FilterData* raw = d.release();
-    vsapi->createVideoFilter(out, "Interpolate", &raw->vi, interp_get_frame, interp_free, fmParallelRequests, deps, 1,
-                             raw, core);
+    vsapi->createVideoFilter(out, "Interpolate", &raw->vi, interp_get_frame, interp_free, fmParallel, deps, 1, raw,
+                             core);
 }
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI* vspapi) {
     vspapi->configPlugin(GPUMV_ID, GPUMV_NS, "GPU motion-compensated frame interpolation",
-                         VS_MAKE_VERSION(0, 13), VAPOURSYNTH_API_VERSION, 0, plugin);
+                         VS_MAKE_VERSION(0, 14), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction("Interpolate",
                              "clip:vnode;num:int;den:int:opt;mode:int:opt;blksize:int:opt;pel:int:opt;radius:int:opt;"
                              "refine:int:opt;lambda:float:opt;lambdaflat:float:opt;texref:float:opt;smooth:int:opt;split:int:opt;thsad:int:opt;gmv:int:opt;temporal:int:opt;zoom:int:opt;lsad:int:opt;plevel:float:opt;pnew:float:opt;pzero:float:opt;badsad:int:opt;badrange:int:opt;trymany:int:opt;satd:int:opt;blend:int:opt;thscd1:int:opt;"

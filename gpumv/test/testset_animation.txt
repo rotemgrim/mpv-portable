@@ -1,0 +1,13 @@
+# Animation scenes for tuning the anime mode: label | file | start
+avatar-series-1 | B:/complete/Avatar - The Last Airbender (2005)/Season 01/Avatar - The Last Airbender (2005) - S01E03 - The Southern Air Temple.flv | 35%
+avatar-series-2 | B:/complete/Avatar - The Last Airbender (2005)/Season 01/Avatar - The Last Airbender (2005) - S01E03 - The Southern Air Temple.flv | 65%
+avatar-series-3 | B:/complete/Avatar - The Last Airbender (2005)/Season 02/Avatar - The Last Airbender (2005) - S02E01 - The Avatar State.flv | 50%
+avatar-film-2   | B:/complete/Avatar.Aang.The.Last.Airbender.2026.2160p.ATVP.WEB-DL.DV.HDR10+.DDP5.1.Atmos.H265.MP4-BTM/Avatar.Aang.The.Last.Airbender.2026.2160p.ATVP.WEB-DL.DV.HDR10+[Ben The Men].mp4 | 70%
+avatar-film-3   | B:/complete/Avatar.Aang.The.Last.Airbender.2026.2160p.ATVP.WEB-DL.DV.HDR10+.DDP5.1.Atmos.H265.MP4-BTM/Avatar.Aang.The.Last.Airbender.2026.2160p.ATVP.WEB-DL.DV.HDR10+[Ben The Men].mp4 | 52%
+ark-1           | B:/complete/ARK.The.Animated.Series.S01.COMPLETE.1080p.AMZN.WEB-DL.DDP5.1.H264-NTb[TGx]/ARK.The.Animated.Series.S01E01.Element.1.1080p.AMZN.WEB-DL.DDP5.1.H.264-NTb.mkv | 30%
+ark-2           | B:/complete/ARK.The.Animated.Series.S01.COMPLETE.1080p.AMZN.WEB-DL.DDP5.1.H264-NTb[TGx]/ARK.The.Animated.Series.S01E01.Element.1.1080p.AMZN.WEB-DL.DDP5.1.H.264-NTb.mkv | 60%
+totoro-1        | B:/complete/1980s ANIME Movies (Pack 2) - 10 Films-OVAs from 1982-1989 - 1080p BluRay DUAL AUDIO x264/06a. My Neighbor Totoro (1988)/My Neighbor Totoro (1988 BluRay - 1080p DUAL Audio).mkv | 30%
+totoro-2        | B:/complete/1980s ANIME Movies (Pack 2) - 10 Films-OVAs from 1982-1989 - 1080p BluRay DUAL AUDIO x264/06a. My Neighbor Totoro (1988)/My Neighbor Totoro (1988 BluRay - 1080p DUAL Audio).mkv | 62%
+cobra-1         | B:/complete/1980s ANIME Movies (Pack 2) - 10 Films-OVAs from 1982-1989 - 1080p BluRay DUAL AUDIO x264/01. Space Adventure Cobra (1982)/Space Adventure Cobra - The Movie (1982 BluRay - 720p JAP Audio).mkv | 45%
+anime-1         | B:/complete/1980s ANIME Movies (Pack 2) - 10 Films-OVAs from 1982-1989 - 1080p BluRay DUAL AUDIO x264/02a. Golgo 13 - The Professional (1983)/Golgo 13 - The Professional (1983 BluRay - 1080p QUAD Audio).mkv | 30%
+anime-2         | B:/complete/1980s ANIME Movies (Pack 2) - 10 Films-OVAs from 1982-1989 - 1080p BluRay DUAL AUDIO x264/02a. Golgo 13 - The Professional (1983)/Golgo 13 - The Professional (1983 BluRay - 1080p QUAD Audio).mkv | 70%

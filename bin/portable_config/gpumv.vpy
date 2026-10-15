@@ -37,7 +37,7 @@ max_fps = cfg_float("max_fps", 120)
 anime = globals().get("ANIME", False)
 # Films use the optical-flow hardware for motion (falls back to the own search
 # on GPUs without it); the anime settings need the own search
-tuned = (("gpumv_anime_blksize", 32), ("gpumv_anime_lambda", 2.0), ("gpumv_anime_mask", 1.0), ("gpumv_anime_nvof", 0)) \
+tuned = (("gpumv_anime_blksize", 32), ("gpumv_anime_lambda", 0.5), ("gpumv_anime_mask", 1.0), ("gpumv_anime_nvof", 0)) \
     if anime else (("gpumv_blksize", 16), ("gpumv_lambda", 0.1), ("gpumv_mask", 0.5), ("gpumv_nvof", 2))
 blksize, lam, mask, nvof = cfg_int(*tuned[0]), cfg_float(*tuned[1]), cfg_float(*tuned[2]), cfg_int(*tuned[3])
 
@@ -63,7 +63,7 @@ if dst > clip.fps:
         bars=cfg_int("gpumv_bars", 1),
         fades=cfg_int("gpumv_fades", 1),
         nvof=nvof,
-        pnew=cfg_float("gpumv_anime_pnew", 100.0) if anime else 0.0,
+        pnew=cfg_float("gpumv_anime_pnew", 0.0) if anime else 0.0,
         satd=cfg_int("gpumv_anime_satd", 1) if anime else 0,
         strength=cfg_float("gpumv_strength", 1.0),
     )
