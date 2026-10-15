@@ -7,6 +7,7 @@ Portable mpv player setup with VapourSynth frame interpolation plugins.
 - **mpv** — video player (gpu-hq profile, display-resample)
 - **VapourSynth** — embedded Python 3.14 + VapourSynth scripting
 - **MVTools** — CPU-based motion-compensated interpolation
+- **gpumv** — our own MVTools-style interpolation on the GPU (CUDA, NVIDIA); source in `gpumv/`
 - **SVPflow** — GPU-accelerated (OpenCL) motion-compensated interpolation
 - **RIFE** — AI-based frame interpolation (GPU via ONNX Runtime: CUDA on NVIDIA, DirectML elsewhere)
 - **ONNX models** — RIFE v4.6 and v4.10
@@ -22,6 +23,9 @@ Portable mpv player setup with VapourSynth frame interpolation plugins.
 | Ctrl+5   | Built-in sphinx                   | GPU (mpv)         |
 | Ctrl+6   | minterpolate (FFmpeg)             | CPU               |
 | Ctrl+7   | SVPflow (60fps)                   | GPU (OpenCL)      |
+| Ctrl+8   | gpumv (films and TV)              | GPU (CUDA)        |
+| Ctrl+9   | gpumv (animation)                 | GPU (CUDA)        |
+| Ctrl+G   | Motion smoothing settings window  | —                 |
 
 ## Configuration
 
@@ -35,12 +39,13 @@ Just run `mpv.exe` — everything is self-contained and portable.
 
 ## Getting a build
 
-- **End users**: download `mpv-portable.exe` from the [latest release](../../releases/latest), double-click, choose a folder, and the portable install is extracted there. Run `bin\mpv.exe` to launch.
+- **End users**: download `mpv-portable-setup.exe` from the [latest release](../../releases/latest) and run it. It installs for the current user (no admin rights) into `%LOCALAPPDATA%\Programs\mpv-portable`, adds a Start menu shortcut, and can add mpv to "Open with" for video files and handle `mpv://` links. Uninstall from Windows Settings > Apps. Updates keep the smoothing settings you changed. The installer leaves out RIFE and SVPflow; Ctrl+4 and Ctrl+7 say so. gpumv (Ctrl+8, Ctrl+9) needs an NVIDIA graphics card.
 - **From source (dev)**: clone this repo, then run `./bootstrap.ps1` once. It downloads the binary payload (mpv.exe, VapourSynth plugins, ONNX models, ...) from the `payload` release tag and extracts it into `bin/`. The repo itself only tracks small text/config/script files; binaries are kept out of git to avoid LFS bandwidth limits.
+- **Building the installer locally**: `./tools/build-installer.ps1` (needs Inno Setup 6: `winget install JRSoftware.InnoSetup`) packages this working tree into `installer\Output\mpv-portable-setup.exe`. CI does the same from the payload plus the repo on every push to master.
 
 ## Refreshing the binary payload
 
-Run `./tools/build-payload.ps1` whenever you update something heavy under `bin/` (new mpv build, updated VS plugin, new ONNX model). It packs the gitignored binaries into `payload.7z` and uploads to the rolling `payload` release tag (requires the `gh` CLI). The next CI build, and any fresh `bootstrap.ps1` invocation, will pick it up automatically.
+Run `./tools/build-payload.ps1` whenever you update something heavy under `bin/` (new mpv build, updated VS plugin such as a rebuilt `gpumv.dll`, new ONNX model). It packs the gitignored binaries into `payload.7z` and uploads to the rolling `payload` release tag (requires the `gh` CLI). The next CI build, and any fresh `bootstrap.ps1` invocation, will pick it up automatically.
 
 ## Optional: NVIDIA CUDA acceleration for RIFE
 

@@ -20,8 +20,8 @@ desktop.ini
 /.idea/
 /.claude/
 
-# Generated at build time by .github/workflows/build-portable.yml
-/mpv.lnk
+# Built by tools/build-installer.ps1
+/installer/Output/
 
 # Build artifacts from tools/build-payload.ps1
 /payload.7z
